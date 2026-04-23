@@ -1,0 +1,216 @@
+# Research Copilot
+
+[English](README.md) | 简体中文
+
+Research Copilot 是一个面向项目范围知识工作的本地优先研究工作台。它把项目管理、文本资产导入、TODO 执行、带引用回答、运行历史和分层记忆整合到一个 FastAPI 服务和浏览器工作区里。
+
+## 项目概览
+
+当前 MVP 围绕固定的 `plan-and-solve` 流程展开：
+
+1. 构建项目上下文
+2. 规划研究任务
+3. 从项目资产中检索证据
+4. 生成带引用的回答
+5. 持久化分层记忆，供后续追问复用
+
+后端同时提供 API 和前端工作区，因此本地部署比较直接。
+
+## 当前能力
+
+- 项目 CRUD 和仪表盘概览
+- 文本、Markdown 资产的创建、编辑与上传
+- TODO 的创建、编辑、删除和直接执行
+- 项目级混合检索，支持 dense + BM25 融合
+- 本地 reranker 对证据做最终排序
+- 带引用回答生成
+- working、episodic、semantic 三层记忆
+- 运行历史和详细执行结果查看
+- 由同一个 FastAPI 服务直接提供浏览器工作区
+
+## 运行行为
+
+- 默认执行模式：`plan_and_solve`
+- 默认 LLM 目标：`deepseek/deepseek-chat`
+- 默认向量库：`qdrant`
+- 默认向量模型：`BAAI/bge-m3`
+- 默认重排模型：`BAAI/bge-reranker-base`
+- 如果设置了 `LLM_API_KEY`，运行时会调用 DeepSeek Chat API 生成答案。
+- 如果 `LLM_API_KEY` 为空，系统会退回到确定性的带引用摘要，保证整条流程仍可执行。
+
+## 架构组成
+
+主要组件如下：
+
+- `FastAPI`：API 路由、生命周期启动和静态工作区页面
+- `SQLAlchemy + MySQL`：项目、资产、TODO、运行记录和记忆持久化
+- `Qdrant`：项目分块和语义记忆的向量存储
+- `BGE-M3`：本地 dense embedding
+- `BM25 + jieba`：词法检索和中文分词
+- `BGE reranker`：本地证据重排
+- `Redis`、`MinIO`、可选 `Ollama`：为后续工作流扩展预留的本地依赖
+
+## 仓库结构
+
+```text
+research_copilot/
+├── backend/
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── models.py
+│   │   ├── services.py
+│   │   ├── vector_store.py
+│   │   ├── memory_manager.py
+│   │   └── static/
+│   ├── tests/
+│   ├── Dockerfile
+│   └── pyproject.toml
+├── docs/
+├── specs/
+├── .env.example
+├── docker-compose.yml
+└── README.md
+```
+
+## 快速开始
+
+### 环境要求
+
+- Docker 和 Docker Compose
+- 至少数 GB 的可用磁盘空间，用于本地 embedding 和 reranker 模型
+- 如果你希望使用真实 LLM 生成而不是 fallback 摘要，需要准备 DeepSeek API Key
+
+### 启动完整本地栈
+
+```bash
+cd /home/wsl/code/research_copilot
+cp .env.example .env
+docker compose up -d --build
+```
+
+启动后可访问：
+
+- 工作区：`http://127.0.0.1:8001/`
+- API 文档：`http://127.0.0.1:8001/docs`
+- 健康检查：`http://127.0.0.1:8001/healthz`
+
+### 可选 Ollama Profile
+
+```bash
+docker compose --profile llm up -d
+```
+
+## 首次运行说明
+
+- `docker-compose.yml` 会把本地 `./models` 挂载到容器内的 `/models`。
+- 如果 `./models` 下还没有所需的 BAAI 模型快照，运行时会在首次使用时从 Hugging Face 自动下载。
+- 这些模型文件体积较大，且已经被排除在 Git 之外。
+- 当前默认单个文本上传大小限制是 `2 MB`。
+
+## 配置说明
+
+把 `.env.example` 复制为 `.env` 后，只修改你需要的项即可。
+
+关键环境变量：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `ENVIRONMENT` | `local` | 运行环境标识 |
+| `LLM_PROVIDER` | `deepseek` | LLM 提供方目标 |
+| `LLM_MODEL` | `deepseek-chat` | 聊天模型名 |
+| `LLM_API_BASE` | `https://api.deepseek.com` | DeepSeek API 地址 |
+| `LLM_API_KEY` | 空 | 设置后启用真实 LLM 回答生成 |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | 本地向量模型 |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-base` | 本地重排模型 |
+| `VECTOR_STORE_PROVIDER` | `qdrant` | 向量存储后端 |
+| `QDRANT_COLLECTION` | `knowledge_chunks` | 知识分块集合名 |
+| `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | 语义记忆集合名 |
+| `EXECUTION_MODE` | `plan_and_solve` | 执行模式 |
+| `UPLOAD_MAX_BYTES` | `2097152` | 文本上传大小上限，单位字节 |
+| `DATABASE_URL` | 空 | 可选，用于覆盖默认 MySQL 连接串 |
+
+## API 概览
+
+Swagger UI 地址是 `/docs`。
+
+主要接口：
+
+| 接口 | 方法 | 作用 |
+| --- | --- | --- |
+| `/healthz` | `GET` | 服务状态和依赖概览 |
+| `/api/v1/config/providers` | `GET` | 当前 provider 配置 |
+| `/api/v1/dashboard` | `GET` | 项目和运行仪表盘 |
+| `/api/v1/projects` | `GET`, `POST` | 查询或创建项目 |
+| `/api/v1/projects/{project_id}` | `GET`, `PATCH`, `DELETE` | 管理单个项目 |
+| `/api/v1/projects/{project_id}/assets` | `GET`, `POST` | 查询或创建项目资产 |
+| `/api/v1/projects/{project_id}/assets/upload-text` | `POST` | 上传 `.txt` 或 `.md` 资产 |
+| `/api/v1/assets/{asset_id}` | `PATCH`, `DELETE` | 更新或删除单个资产 |
+| `/api/v1/projects/{project_id}/todos` | `GET`, `POST` | 查询或创建 TODO |
+| `/api/v1/todos/{todo_id}` | `PATCH`, `DELETE` | 更新或删除单个 TODO |
+| `/api/v1/projects/{project_id}/run` | `POST` | 执行一次研究任务 |
+| `/api/v1/projects/{project_id}/runs` | `GET` | 查看运行历史 |
+| `/api/v1/projects/{project_id}/memory` | `GET` | 查看分层记忆记录 |
+| `/api/v1/runtime/research/run` | `POST` | 直接调用运行时管线 |
+
+### 示例：上传文本资产
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-text \
+  -F "asset_type=note" \
+  -F "title=system-notes.txt" \
+  -F "file=@./system-notes.txt"
+```
+
+### 示例：执行研究任务
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_query": "请总结论文与代码仓之间的关系",
+    "asset_ids": []
+  }'
+```
+
+## 本地开发
+
+安装后端包：
+
+```bash
+python3 -m pip install --user -e ./backend
+```
+
+直接从 `backend/` 启动 API：
+
+```bash
+cd backend
+python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
+
+基础检查：
+
+```bash
+python3 -m compileall backend/app
+cd backend && pytest -q
+curl http://127.0.0.1:8001/healthz
+```
+
+## 当前范围与限制
+
+- 当前 MVP 主要面向文本类项目资产。
+- 浏览器工作区由后端直接提供，更适合本地环境使用。
+- Docker 栈里已经准备了 Redis 和 MinIO，但当前核心研究闭环主要依赖 FastAPI、MySQL、本地检索和 Qdrant。
+- PDF 导入、OCR、报告导出和更完整的工作流集成仍然在路线图中。
+
+## 文档
+
+- [系统架构](docs/architecture.md)
+- [用户手册](docs/user-manual.md)
+- [技术亮点](docs/technical-highlights.md)
+- [MVP 路线图](docs/mvp-roadmap.md)
+- [源码映射](docs/source-mapping.md)
+- [工作流契约](specs/workflows/research-copilot.yaml)
+
+## License
+
+仓库当前还没有附带 license 文件。

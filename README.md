@@ -1,47 +1,66 @@
 # Research Copilot
 
-Research Copilot is a local-first knowledge workspace built around a
-`plan-and-solve` runtime. It supports project management, text assets, TODO
-execution, cited answers, run history, long-term memory, and real vector
-retrieval.
+English | [简体中文](README.zh-CN.md)
 
-## Current MVP
+Research Copilot is a local-first research workspace for project-scoped knowledge work. It combines project management, text asset ingestion, TODO execution, cited answers, run history, and layered memory in a single FastAPI service with a browser-based UI.
 
-This repository now includes a complete backend and a browser-based workspace:
+## Overview
 
-- project CRUD
-- text asset ingestion and editing
-- TODO CRUD and execution
-- plan-and-solve run pipeline
-- text file upload from the browser workspace
-- local `bge-m3` embeddings with Qdrant vector search
-- hybrid retrieval with dense + BM25 fusion
-- local BGE reranker for final evidence ordering
-- cited answer generation through DeepSeek chat
-- layered memory with working / episodic / semantic recall
-- long-term memory persistence
-- run history and dashboard views
+The current MVP is built around a fixed `plan-and-solve` runtime:
 
-Model configuration in the current MVP:
+1. build project context
+2. plan tasks
+3. retrieve evidence from project assets
+4. synthesize a cited answer
+5. persist layered memory for follow-up runs
 
-- LLM provider: `deepseek`
-- Embedding provider: `local`
-- Reranker provider: `local`
-- Vector store: `qdrant`
-- Memory model: `working + episodic + semantic`
-- Execution mode: `plan_and_solve`
+The backend serves both the API and the workspace UI, which keeps local deployment simple.
 
-## Repo Layout
+## Current Capabilities
+
+- Project CRUD with dashboard summaries
+- Text and Markdown asset creation, editing, and upload
+- TODO CRUD and direct TODO execution
+- Project-scoped hybrid retrieval with dense + BM25 fusion
+- Local reranking for evidence ordering
+- Cited answer generation
+- Layered memory with working, episodic, and semantic recall
+- Run history and detailed execution traces
+- Browser workspace served from the same FastAPI app
+
+## Runtime Behavior
+
+- Default execution mode: `plan_and_solve`
+- Default LLM target: `deepseek/deepseek-chat`
+- Default vector store: `qdrant`
+- Default embedding model: `BAAI/bge-m3`
+- Default reranker model: `BAAI/bge-reranker-base`
+- If `LLM_API_KEY` is set, the runtime can call the DeepSeek chat API for answer synthesis.
+- If `LLM_API_KEY` is empty, the runtime falls back to a deterministic cited summary so the end-to-end workflow still works.
+
+## Architecture
+
+Main building blocks:
+
+- `FastAPI`: API routes, lifecycle startup, and static workspace hosting
+- `SQLAlchemy + MySQL`: project, asset, TODO, run, and memory persistence
+- `Qdrant`: vector storage for project chunks and semantic memory
+- `BGE-M3`: local dense embeddings
+- `BM25 + jieba`: lexical retrieval and Chinese-aware tokenization
+- `BGE reranker`: local evidence reranking
+- `Redis`, `MinIO`, optional `Ollama`: provisioned in the local stack for planned workflow expansion
+
+## Repository Layout
 
 ```text
 research_copilot/
 ├── backend/
 │   ├── app/
-│   │   ├── db.py
-│   │   ├── db_models.py
 │   │   ├── main.py
 │   │   ├── models.py
 │   │   ├── services.py
+│   │   ├── vector_store.py
+│   │   ├── memory_manager.py
 │   │   └── static/
 │   ├── tests/
 │   ├── Dockerfile
@@ -49,10 +68,19 @@ research_copilot/
 ├── docs/
 ├── specs/
 ├── .env.example
-└── docker-compose.yml
+├── docker-compose.yml
+└── README.zh-CN.md
 ```
 
-## Run Locally
+## Quick Start
+
+### Requirements
+
+- Docker and Docker Compose
+- Several GB of free disk space for local embedding and reranker models
+- A DeepSeek API key if you want live LLM answer generation instead of fallback summaries
+
+### Run The Full Local Stack
 
 ```bash
 cd /home/wsl/code/research_copilot
@@ -60,13 +88,71 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-After startup:
+Open:
 
 - Workspace: `http://127.0.0.1:8001/`
 - API docs: `http://127.0.0.1:8001/docs`
 - Health check: `http://127.0.0.1:8001/healthz`
 
-You can now upload a `.txt` or `.md` file from the workspace or call:
+### Optional Ollama Profile
+
+```bash
+docker compose --profile llm up -d
+```
+
+## First-Run Notes
+
+- `docker-compose.yml` mounts `./models` to `/models` inside the runtime container.
+- If the required BAAI model snapshots are not already present under `./models`, the runtime will download them from Hugging Face on first use.
+- Those model files are intentionally excluded from Git and can be large.
+- The default upload limit is `2 MB` per text file.
+
+## Configuration
+
+Copy `.env.example` to `.env` and update only what you need.
+
+Important variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ENVIRONMENT` | `local` | Runtime environment label |
+| `LLM_PROVIDER` | `deepseek` | LLM provider target |
+| `LLM_MODEL` | `deepseek-chat` | Chat model name |
+| `LLM_API_BASE` | `https://api.deepseek.com` | DeepSeek API base URL |
+| `LLM_API_KEY` | empty | Enables live LLM answer generation when set |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | Local embedding model |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-base` | Local reranker model |
+| `VECTOR_STORE_PROVIDER` | `qdrant` | Vector store backend |
+| `QDRANT_COLLECTION` | `knowledge_chunks` | Chunk collection name |
+| `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | Semantic memory collection name |
+| `EXECUTION_MODE` | `plan_and_solve` | Runtime execution mode |
+| `UPLOAD_MAX_BYTES` | `2097152` | Max uploaded text size in bytes |
+| `DATABASE_URL` | empty | Optional override for MySQL connection string |
+
+## API Overview
+
+Swagger UI is available at `/docs`.
+
+Key endpoints:
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/healthz` | `GET` | Service health and dependency summary |
+| `/api/v1/config/providers` | `GET` | Active provider configuration |
+| `/api/v1/dashboard` | `GET` | Project and run dashboard |
+| `/api/v1/projects` | `GET`, `POST` | List or create projects |
+| `/api/v1/projects/{project_id}` | `GET`, `PATCH`, `DELETE` | Manage a project |
+| `/api/v1/projects/{project_id}/assets` | `GET`, `POST` | List or create project assets |
+| `/api/v1/projects/{project_id}/assets/upload-text` | `POST` | Upload a `.txt` or `.md` asset |
+| `/api/v1/assets/{asset_id}` | `PATCH`, `DELETE` | Update or delete one asset |
+| `/api/v1/projects/{project_id}/todos` | `GET`, `POST` | List or create TODOs |
+| `/api/v1/todos/{todo_id}` | `PATCH`, `DELETE` | Update or delete one TODO |
+| `/api/v1/projects/{project_id}/run` | `POST` | Execute one research run |
+| `/api/v1/projects/{project_id}/runs` | `GET` | List run history |
+| `/api/v1/projects/{project_id}/memory` | `GET` | List layered memory records |
+| `/api/v1/runtime/research/run` | `POST` | Direct runtime pipeline endpoint |
+
+### Example: Upload A Text Asset
 
 ```bash
 curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-text \
@@ -75,17 +161,56 @@ curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-te
   -F "file=@./system-notes.txt"
 ```
 
-## Test
+### Example: Run Research
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_query": "Summarize the relationship between the paper and the codebase",
+    "asset_ids": []
+  }'
+```
+
+## Local Development
+
+Install the backend package:
+
+```bash
+python3 -m pip install --user -e ./backend
+```
+
+Run the API directly from `backend/`:
 
 ```bash
 cd backend
-pytest -q
-python3 -m compileall app tests
+python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8001
 ```
+
+Basic checks:
+
+```bash
+python3 -m compileall backend/app
+cd backend && pytest -q
+curl http://127.0.0.1:8001/healthz
+```
+
+## Current Scope
+
+- The current MVP focuses on text-based project assets.
+- The browser workspace is served by the backend and is designed for local use.
+- The Docker stack provisions Redis and MinIO for planned workflow growth, but the core research loop today is centered on FastAPI, MySQL, local retrieval, and Qdrant.
+- PDF ingestion, OCR, report export, and broader workflow integration are still roadmap items.
 
 ## Documentation
 
-- Architecture: [docs/architecture.md](docs/architecture.md)
-- User manual: [docs/user-manual.md](docs/user-manual.md)
-- Technical highlights: [docs/technical-highlights.md](docs/technical-highlights.md)
-- Source mapping: [docs/source-mapping.md](docs/source-mapping.md)
+- [Architecture](docs/architecture.md)
+- [User Manual](docs/user-manual.md)
+- [Technical Highlights](docs/technical-highlights.md)
+- [Source Mapping](docs/source-mapping.md)
+- [MVP Roadmap](docs/mvp-roadmap.md)
+- [Workflow Contract](specs/workflows/research-copilot.yaml)
+
+## License
+
+No license file is included yet.

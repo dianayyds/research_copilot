@@ -1,0 +1,109 @@
+id: research-copilot
+name: Research Copilot Workflow
+version: 0.1.0
+description: >
+  Project-scoped research workflow for paper, notes, and codebase questions.
+
+input:
+  type: object
+  required:
+    - project_id
+    - user_query
+  properties:
+    project_id:
+      type: string
+    user_query:
+      type: string
+    asset_ids:
+      type: array
+      items:
+        type: string
+    session_id:
+      type: string
+
+nodes:
+  - id: resolve_project
+    type: project_loader
+    runtime: workflow-shell
+
+  - id: pack_context
+    type: runtime_api
+    action: build_context
+    runtime: python-runtime
+
+  - id: plan_research
+    type: runtime_api
+    action: plan_tasks
+    runtime: python-runtime
+
+  - id: retrieve_evidence
+    type: runtime_api
+    action: hybrid_retrieve
+    runtime: python-runtime
+    mode: parallel
+
+  - id: rank_evidence
+    type: runtime_api
+    action: rerank_evidence
+    runtime: python-runtime
+
+  - id: synthesize_answer
+    type: runtime_api
+    action: answer_with_citations
+    runtime: python-runtime
+
+  - id: persist_memory
+    type: runtime_api
+    action: consolidate_memory
+    runtime: python-runtime
+
+  - id: emit_result
+    type: output
+    runtime: workflow-shell
+
+edges:
+  - from: resolve_project
+    to: pack_context
+
+  - from: pack_context
+    to: plan_research
+
+  - from: plan_research
+    to: retrieve_evidence
+
+  - from: retrieve_evidence
+    to: rank_evidence
+
+  - from: rank_evidence
+    to: synthesize_answer
+
+  - from: synthesize_answer
+    to: persist_memory
+
+  - from: persist_memory
+    to: emit_result
+
+output:
+  type: object
+  properties:
+    answer:
+      type: string
+    citations:
+      type: array
+      items:
+        type: object
+        properties:
+          asset_id:
+            type: string
+          chunk_id:
+            type: string
+          label:
+            type: string
+          score:
+            type: number
+    memory_updates:
+      type: array
+      items:
+        type: object
+    trace_id:
+      type: string

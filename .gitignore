@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment files
+.env
+
+# Local model assets
+models/
+
+# Test and type-check caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store

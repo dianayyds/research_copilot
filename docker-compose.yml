@@ -1,0 +1,150 @@
+services:
+  runtime-api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: research-copilot-runtime
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      BACKEND_PORT: ${BACKEND_PORT:-8001}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_studio}
+      MYSQL_USER: ${MYSQL_USER:-agent}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agent}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MINIO_HOST: minio
+      MINIO_PORT: 9000
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-knowledge_chunks}
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      EMBEDDING_MODEL_DIR: ${EMBEDDING_MODEL_DIR:-/models}
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1024}
+      EMBEDDING_MAX_LENGTH: ${EMBEDDING_MAX_LENGTH:-2048}
+      RERANKER_PROVIDER: ${RERANKER_PROVIDER:-local}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-base}
+      RERANKER_MODEL_DIR: ${RERANKER_MODEL_DIR:-/models}
+      RERANKER_DEVICE: ${RERANKER_DEVICE:-cpu}
+      RERANKER_MAX_LENGTH: ${RERANKER_MAX_LENGTH:-1024}
+      VECTOR_STORE_PROVIDER: ${VECTOR_STORE_PROVIDER:-qdrant}
+      SEMANTIC_MEMORY_COLLECTION: ${SEMANTIC_MEMORY_COLLECTION:-semantic_memory_facts}
+      HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
+      EXECUTION_MODE: ${EXECUTION_MODE:-plan_and_solve}
+      RETRIEVAL_CANDIDATE_LIMIT: ${RETRIEVAL_CANDIDATE_LIMIT:-16}
+      WORKING_MEMORY_LIMIT: ${WORKING_MEMORY_LIMIT:-8}
+      EPISODIC_MEMORY_LIMIT: ${EPISODIC_MEMORY_LIMIT:-4}
+      SEMANTIC_MEMORY_LIMIT: ${SEMANTIC_MEMORY_LIMIT:-6}
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-2097152}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    ports:
+      - "${BACKEND_PORT:-8001}:8001"
+    volumes:
+      - ./models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  mysql:
+    image: mysql:8.4
+    container_name: pcs-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_studio}
+      MYSQL_USER: ${MYSQL_USER:-agent}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-agent}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: pcs-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+  minio:
+    image: minio/minio:latest
+    container_name: pcs-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}; do sleep 2; done &&
+      mc mb -p local/${MINIO_BUCKET_RAW:-agent-raw} || true &&
+      mc mb -p local/${MINIO_BUCKET_ARTIFACTS:-agent-artifacts} || true
+      "
+    restart: "no"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: pcs-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pcs-ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    profiles:
+      - llm
+
+volumes:
+  mysql_data:
+  redis_data:
+  minio_data:
+  qdrant_data:
+  ollama_data:

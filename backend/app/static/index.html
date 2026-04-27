@@ -1,185 +1,140 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Research Copilot Workspace</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <title>Research Copilot</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260424-stream" />
   </head>
   <body>
-    <div class="shell">
+    <div class="app-shell" id="app-shell">
       <aside class="sidebar">
-        <div class="brand">
-          <p class="eyebrow">Plan and Solve</p>
-          <h1>Research Copilot</h1>
-          <p class="muted">本地知识工作台 / TODO 研究执行台</p>
+        <div class="sidebar-viewport">
+          <div class="sidebar-top">
+            <div class="brand">
+              <div class="brand-mark">RC</div>
+              <span>Research Copilot</span>
+            </div>
+            <div class="nav-stack">
+              <button class="nav-button primary" id="new-session-button" type="button">
+                <span class="nav-icon">+</span>
+                <span>新对话</span>
+              </button>
+              <button class="nav-button" id="asset-toggle-button" type="button">
+                <span class="nav-icon">□</span>
+                <span>资产</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="sidebar-section">
+            <div class="sidebar-section-title">最近</div>
+            <div class="session-list" id="session-list"></div>
+          </div>
         </div>
-
-        <section class="panel compact">
-          <div class="panel-header">
-            <h2>概览</h2>
-          </div>
-          <div id="dashboard" class="stats-grid"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-header">
-            <h2>新建项目</h2>
-          </div>
-          <form id="project-form" class="stack">
-            <input name="title" placeholder="项目标题" required />
-            <textarea name="description" rows="3" placeholder="项目描述"></textarea>
-            <button type="submit">创建项目</button>
-          </form>
-        </section>
-
-        <section class="panel grow">
-          <div class="panel-header">
-            <h2>项目列表</h2>
-          </div>
-          <div id="project-list" class="list"></div>
-        </section>
       </aside>
 
-      <main class="workspace">
-        <header class="workspace-header">
-          <div>
-            <p class="eyebrow">Workspace</p>
-            <h2 id="project-title">选择一个项目开始</h2>
-            <p id="project-description" class="muted">可以先创建项目，再补充资产、TODO 和研究请求。</p>
-          </div>
-          <section class="config-card">
-            <h3>模型配置</h3>
-            <div id="provider-config" class="config-lines"></div>
-          </section>
+      <main class="main-panel">
+        <header class="topbar">
+          <div class="topbar-title" id="chat-title">新对话</div>
+          <button class="topbar-menu" type="button" aria-label="更多">···</button>
         </header>
 
-        <section class="workspace-grid">
-          <section class="panel">
-            <div class="panel-header">
-              <h2>知识资产</h2>
-            </div>
-            <form id="asset-form" class="stack">
-              <input type="hidden" name="asset_id" />
-              <input name="title" placeholder="资产标题，例如论文摘要" required />
-              <select name="asset_type">
-                <option value="note">笔记</option>
-                <option value="paper">论文</option>
-                <option value="code">代码</option>
-                <option value="slide">课件</option>
-              </select>
-              <textarea name="content" rows="6" placeholder="粘贴文本内容，用于检索与引用" required></textarea>
-              <div class="button-row">
-                <button type="submit">保存资产</button>
-                <button type="button" id="asset-reset" class="secondary">清空</button>
+        <section class="chat-stream" id="chat-stream"></section>
+
+        <section class="composer-shell">
+          <form class="composer-card" id="composer-form">
+            <textarea
+              id="composer-query"
+              name="query"
+              rows="1"
+              placeholder="给我一个任务，或继续当前对话"
+            ></textarea>
+            <div class="composer-footer">
+              <div class="composer-left">
+                <div class="composer-hint" id="sequence-hint">下一轮 #1</div>
+                <label class="agent-toggle">
+                  <input id="agent-mode-toggle" type="checkbox" />
+                  <span>Agent</span>
+                </label>
               </div>
-            </form>
-            <form id="asset-upload-form" class="stack">
-              <input name="upload_title" placeholder="上传后的标题，可选" />
-              <select name="asset_type">
-                <option value="note">笔记</option>
-                <option value="paper">论文</option>
-                <option value="code">代码</option>
-                <option value="slide">课件</option>
-              </select>
-              <input
-                type="file"
-                name="file"
-                accept=".txt,.md,.py,.json,.yaml,.yml,.csv,.js,.ts,.java,.go,.rs,.sql,.html,.css"
-                required
-              />
-              <button type="submit">上传文本文件</button>
-            </form>
-            <div id="asset-list" class="list rich-list"></div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header">
-              <h2>TODO 列表</h2>
+              <button class="send-button" id="composer-submit" type="submit" aria-label="发送">
+                <span>↑</span>
+              </button>
             </div>
-            <form id="todo-form" class="stack">
-              <input type="hidden" name="todo_id" />
-              <input name="title" placeholder="TODO 标题" required />
-              <textarea name="description" rows="4" placeholder="描述要研究的问题、交付目标或验收标准"></textarea>
-              <div class="inline-grid">
-                <select name="priority">
-                  <option value="high">高</option>
-                  <option value="medium" selected>中</option>
-                  <option value="low">低</option>
-                </select>
-                <select name="status">
-                  <option value="todo">待办</option>
-                  <option value="in_progress">进行中</option>
-                  <option value="done">已完成</option>
-                  <option value="blocked">阻塞</option>
-                </select>
-              </div>
-              <div class="button-row">
-                <button type="submit">保存 TODO</button>
-                <button type="button" id="todo-reset" class="secondary">清空</button>
-              </div>
-            </form>
-            <div id="todo-list" class="list"></div>
-          </section>
-        </section>
-
-        <section class="workspace-grid">
-          <section class="panel">
-            <div class="panel-header">
-              <h2>执行面板</h2>
-            </div>
-            <form id="run-form" class="stack">
-              <textarea name="user_query" rows="5" placeholder="输入自定义研究问题，或从 TODO 中点击执行"></textarea>
-              <button type="submit">开始研究</button>
-            </form>
-            <div id="run-status" class="status-box">等待执行</div>
-            <div id="run-result" class="result-grid"></div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header">
-              <h2>运行记录</h2>
-            </div>
-            <div id="run-list" class="list"></div>
-          </section>
-        </section>
-
-        <section class="workspace-grid">
-          <section class="panel">
-            <div class="panel-header">
-              <h2>长期记忆</h2>
-            </div>
-            <div id="memory-list" class="list"></div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header">
-              <h2>系统说明</h2>
-            </div>
-            <div class="stack muted">
-              <p>当前执行模式固定为 <strong>plan and solve</strong>。</p>
-              <p>大模型配置预设为 <strong>DeepSeek API</strong>，Embedding 配置预设为 <strong>本地模型</strong>。</p>
-              <p>本版先实现项目、资产、TODO、检索、引用、记忆和运行记录的完整闭环，便于后续替换真实模型推理。</p>
-            </div>
-          </section>
+          </form>
         </section>
       </main>
-    </div>
 
-    <div id="run-detail-modal" class="modal" hidden>
-      <div class="modal-backdrop" data-close-run-modal></div>
-      <section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="run-detail-title">
-        <header class="modal-header">
+      <div class="asset-backdrop" id="asset-backdrop" hidden></div>
+      <aside class="asset-drawer" id="asset-drawer" hidden>
+        <div class="asset-drawer-header">
           <div>
-            <p class="eyebrow">Run Detail</p>
-            <h2 id="run-detail-title">运行详情</h2>
+            <div class="drawer-label">资产</div>
+            <h2>知识资产</h2>
           </div>
-          <button type="button" class="modal-close" id="run-detail-close" aria-label="关闭">关闭</button>
-        </header>
-        <div id="run-detail-body" class="modal-body"></div>
-      </section>
+          <button class="drawer-close" id="asset-close-button" type="button">关闭</button>
+        </div>
+
+        <form class="panel-card asset-form" id="asset-form">
+          <input type="hidden" name="asset_id" />
+          <label class="field">
+            <span>标题</span>
+            <input name="title" maxlength="120" required placeholder="例如：强化学习课程笔记" />
+          </label>
+          <label class="field">
+            <span>类型</span>
+            <select name="asset_type">
+              <option value="note">笔记</option>
+              <option value="markdown">Markdown</option>
+              <option value="paper">论文</option>
+              <option value="pdf">PDF</option>
+              <option value="course">课件</option>
+              <option value="doc">文档</option>
+              <option value="code">代码</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>内容</span>
+            <textarea name="content" rows="7" required placeholder="直接粘贴文本内容"></textarea>
+          </label>
+          <div class="form-actions">
+            <button class="ghost-button" id="asset-reset" type="button">清空</button>
+            <button class="dark-button" type="submit">保存资产</button>
+          </div>
+        </form>
+
+        <form class="panel-card asset-form" id="asset-upload-form">
+          <div class="drawer-label">引入文档</div>
+          <label class="field">
+            <span>标题</span>
+            <input name="upload_title" maxlength="120" placeholder="可选，不填则使用文件名" />
+          </label>
+          <label class="field">
+            <span>类型</span>
+            <select name="asset_type">
+              <option value="doc">文档</option>
+              <option value="markdown">Markdown</option>
+              <option value="pdf">PDF</option>
+              <option value="paper">论文</option>
+              <option value="note">笔记</option>
+              <option value="course">课件</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>文件</span>
+            <input name="file" type="file" accept=".txt,.md,.markdown,.pdf" />
+          </label>
+          <button class="dark-button" type="submit">导入文件</button>
+        </form>
+
+        <div class="asset-library">
+          <div class="drawer-label">已保存资产</div>
+          <div class="asset-list" id="asset-list"></div>
+        </div>
+      </aside>
     </div>
 
-    <script src="/static/app.js" type="module"></script>
+    <script src="/static/app.js?v=20260424-upload-log"></script>
   </body>
 </html>

@@ -16,14 +16,21 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 
 后端同时提供 API 和前端工作区，因此本地部署比较直接。
 
+## 主页面预览
+
+![Research Copilot 主页面与 Agent 执行轨迹](docs/images/main-page-agent-trace.png)
+
+主页面把对话、项目资产和运行历史放在同一个工作区里。左侧栏用于新建对话、查看资产和切换最近会话，中间区域展示当前问答。当勾选 Agent 模式时，回答区域会显示逐步执行轨迹，方便查看系统如何选择本地 RAG、公开搜索、记忆、TODO、资产列表或计算器等工具，并最终生成回答。
+
 ## 当前能力
 
 - 项目 CRUD 和仪表盘概览
-- 文本、Markdown 资产的创建、编辑与上传
+- 文本、Markdown 和 PDF 资产的创建、编辑与上传
 - TODO 的创建、编辑、删除和直接执行
 - 项目级混合检索，支持 dense + BM25 融合
 - 本地 reranker 对证据做最终排序
 - 带引用回答生成
+- 实时/公开信息工具路由，天气类问题优先调用外部天气工具
 - working、episodic、semantic 三层记忆
 - 运行历史和详细执行结果查看
 - 由同一个 FastAPI 服务直接提供浏览器工作区
@@ -105,7 +112,7 @@ docker compose --profile llm up -d
 - `docker-compose.yml` 会把本地 `./models` 挂载到容器内的 `/models`。
 - 如果 `./models` 下还没有所需的 BAAI 模型快照，运行时会在首次使用时从 Hugging Face 自动下载。
 - 这些模型文件体积较大，且已经被排除在 Git 之外。
-- 当前默认单个文本上传大小限制是 `2 MB`。
+- 当前默认单个文件上传大小限制是 `100 MB`。
 
 ## 配置说明
 
@@ -126,7 +133,13 @@ docker compose --profile llm up -d
 | `QDRANT_COLLECTION` | `knowledge_chunks` | 知识分块集合名 |
 | `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | 语义记忆集合名 |
 | `EXECUTION_MODE` | `plan_and_solve` | 执行模式 |
-| `UPLOAD_MAX_BYTES` | `2097152` | 文本上传大小上限，单位字节 |
+| `UPLOAD_MAX_BYTES` | `104857600` | 文件上传大小上限，单位字节 |
+| `LIVE_TOOLS_ENABLED` | `true` | 是否启用实时/公开信息工具路由 |
+| `LLM_TOOL_PLANNER_ENABLED` | `true` | 是否让 LLM 先决定实时工具，再回退规则 |
+| `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | 单次 LLM 工具规划调用超时时间 |
+| `AGENT_MAX_STEPS` | `5` | `/agent/run` 的 Plan-Act-Observe 最大步数 |
+| `PUBLIC_WEB_SEARCH_ENABLED` | `true` | 是否允许显式联网/搜索类问题调用公开搜索工具 |
+| `LIVE_TOOL_TIMEOUT_SECONDS` | `8.0` | 单次外部工具调用超时时间 |
 | `DATABASE_URL` | 空 | 可选，用于覆盖默认 MySQL 连接串 |
 
 ## API 概览
@@ -197,10 +210,10 @@ curl http://127.0.0.1:8001/healthz
 
 ## 当前范围与限制
 
-- 当前 MVP 主要面向文本类项目资产。
+- 当前 MVP 主要面向文本类和 PDF 研究资产。
 - 浏览器工作区由后端直接提供，更适合本地环境使用。
 - Docker 栈里已经准备了 Redis 和 MinIO，但当前核心研究闭环主要依赖 FastAPI、MySQL、本地检索和 Qdrant。
-- PDF 导入、OCR、报告导出和更完整的工作流集成仍然在路线图中。
+- OCR、报告导出和更完整的工作流集成仍然在路线图中。
 
 ## 文档
 

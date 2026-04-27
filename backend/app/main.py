@@ -2,72 +2,78 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
+import logging
 from pathlib import Path
+from time import perf_counter
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.asset_ingest import parse_uploaded_asset
 from app.config import settings
 from app.db import get_db, init_db
 from app.models import (
-    AnswerWithCitationsRequest,
     AssetCreate,
     AssetResponse,
     AssetUpdate,
-    ConsolidateMemoryRequest,
-    DashboardResponse,
+    ChatSessionCreate,
+    ChatSessionResponse,
+    ChatSessionUpdate,
     MemoryRecordResponse,
     ProjectCreate,
     ProjectResponse,
-    ProjectScopedRequest,
     ProjectUpdate,
-    ProviderConfigResponse,
     ResearchRunDetailResponse,
-    ResearchRunRequest,
-    ResearchRunSummaryResponse,
+    ResearchTurnRequest,
+    TurnScopedRequest,
     TodoCreate,
     TodoResponse,
     TodoUpdate,
 )
+from app.semantic_store import ensure_semantic_memory_store
 from app.services import (
-    answer_with_citations,
-    build_context,
-    consolidate_memory,
+    create_agent_and_run,
     create_and_run,
     create_asset,
     create_project,
+    create_session,
     create_todo,
-    dashboard,
-    decode_text_content,
     delete_asset,
     delete_project,
+    delete_session,
     delete_todo,
     get_project,
     get_run,
-    hybrid_retrieve,
     list_assets,
     list_memory,
     list_projects,
-    list_runs,
+    list_session_runs,
+    list_sessions,
     list_todos,
-    plan_tasks,
     project_to_response,
-    provider_config,
-    resolve_assets,
-    run_research,
+    stream_agent_events,
+    stream_research_events,
     update_asset,
     update_project,
+    update_session,
     update_todo,
-    uploaded_asset_title,
 )
-from app.semantic_store import ensure_semantic_memory_store
 from app.vector_store import ensure_vector_store
 
 
 static_dir = Path(__file__).parent / "static"
+logger = logging.getLogger("uvicorn.error")
+
+
+def format_file_size(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.0f}MB"
+    if size >= 1024:
+        return f"{size / 1024:.0f}KB"
+    return f"{size}B"
 
 
 @asynccontextmanager
@@ -81,7 +87,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Research Copilot Runtime API",
     version=settings.app_version,
-    description="Plan-and-solve local research workspace with project TODOs, assets, runs, and memory.",
+    description="Project-scoped chat workspace with layered memory and a global knowledge base.",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -91,16 +97,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 @app.get("/", include_in_schema=False)
-def workspace() -> FileResponse:
-    return FileResponse(static_dir / "index.html")
+async def workspace() -> HTMLResponse:
+    return HTMLResponse(
+        (static_dir / "index.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/static/{filename}", include_in_schema=False)
+async def static_asset(filename: str) -> Response:
+    path = static_dir / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Static file not found")
+    media_type = {
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+    }.get(path.suffix, "text/plain; charset=utf-8")
+    return Response(
+        path.read_text(encoding="utf-8"),
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, object]:
+async def healthz() -> dict[str, object]:
     return {
         "status": "ok",
         "service": settings.app_name,
@@ -121,28 +145,18 @@ def healthz() -> dict[str, object]:
     }
 
 
-@app.get("/api/v1/config/providers", response_model=ProviderConfigResponse)
-def provider_config_endpoint() -> ProviderConfigResponse:
-    return provider_config()
-
-
-@app.get("/api/v1/dashboard", response_model=DashboardResponse)
-def dashboard_endpoint(db: Session = Depends(get_db)) -> DashboardResponse:
-    return dashboard(db)
-
-
 @app.get("/api/v1/projects", response_model=list[ProjectResponse])
-def list_projects_endpoint(db: Session = Depends(get_db)) -> list[ProjectResponse]:
+async def list_projects_endpoint(db: Session = Depends(get_db)) -> list[ProjectResponse]:
     return list_projects(db)
 
 
 @app.post("/api/v1/projects", response_model=ProjectResponse)
-def create_project_endpoint(payload: ProjectCreate, db: Session = Depends(get_db)) -> ProjectResponse:
+async def create_project_endpoint(payload: ProjectCreate, db: Session = Depends(get_db)) -> ProjectResponse:
     return create_project(db, payload)
 
 
 @app.get("/api/v1/projects/{project_id}", response_model=ProjectResponse)
-def get_project_endpoint(project_id: str, db: Session = Depends(get_db)) -> ProjectResponse:
+async def get_project_endpoint(project_id: str, db: Session = Depends(get_db)) -> ProjectResponse:
     try:
         return project_to_response(db, get_project(db, project_id))
     except ValueError as exc:
@@ -150,7 +164,7 @@ def get_project_endpoint(project_id: str, db: Session = Depends(get_db)) -> Proj
 
 
 @app.patch("/api/v1/projects/{project_id}", response_model=ProjectResponse)
-def update_project_endpoint(project_id: str, payload: ProjectUpdate, db: Session = Depends(get_db)) -> ProjectResponse:
+async def update_project_endpoint(project_id: str, payload: ProjectUpdate, db: Session = Depends(get_db)) -> ProjectResponse:
     try:
         return update_project(db, project_id, payload)
     except ValueError as exc:
@@ -158,7 +172,7 @@ def update_project_endpoint(project_id: str, payload: ProjectUpdate, db: Session
 
 
 @app.delete("/api/v1/projects/{project_id}")
-def delete_project_endpoint(project_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
+async def delete_project_endpoint(project_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
     try:
         delete_project(db, project_id)
         return {"status": "deleted"}
@@ -166,49 +180,261 @@ def delete_project_endpoint(project_id: str, db: Session = Depends(get_db)) -> d
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/api/v1/projects/{project_id}/assets", response_model=list[AssetResponse])
-def list_assets_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[AssetResponse]:
+@app.get("/api/v1/projects/{project_id}/sessions", response_model=list[ChatSessionResponse])
+async def list_sessions_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[ChatSessionResponse]:
     try:
-        return list_assets(db, project_id)
+        return list_sessions(db, project_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/projects/{project_id}/assets", response_model=AssetResponse)
-def create_asset_endpoint(project_id: str, payload: AssetCreate, db: Session = Depends(get_db)) -> AssetResponse:
-    try:
-        return create_asset(db, project_id, payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post("/api/v1/projects/{project_id}/assets/upload-text", response_model=AssetResponse)
-async def upload_text_asset_endpoint(
+@app.post("/api/v1/projects/{project_id}/sessions", response_model=ChatSessionResponse)
+async def create_session_endpoint(
     project_id: str,
+    payload: ChatSessionCreate,
+    db: Session = Depends(get_db),
+) -> ChatSessionResponse:
+    try:
+        return create_session(db, project_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/sessions/{session_id}", response_model=ChatSessionResponse)
+async def update_session_endpoint(
+    session_id: str,
+    payload: ChatSessionUpdate,
+    db: Session = Depends(get_db),
+) -> ChatSessionResponse:
+    try:
+        return update_session(db, session_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/v1/projects/{project_id}/sessions/{session_id}")
+async def delete_session_endpoint(project_id: str, session_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
+    try:
+        delete_session(db, project_id, session_id)
+        return {"status": "deleted"}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/projects/{project_id}/sessions/{session_id}/runs",
+    response_model=list[ResearchRunDetailResponse],
+)
+async def list_session_runs_endpoint(
+    project_id: str,
+    session_id: str,
+    db: Session = Depends(get_db),
+) -> list[ResearchRunDetailResponse]:
+    try:
+        return list_session_runs(db, project_id, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/sessions/{session_id}/run",
+    response_model=ResearchRunDetailResponse,
+)
+async def create_and_run_endpoint(
+    project_id: str,
+    session_id: str,
+    payload: ResearchTurnRequest,
+    db: Session = Depends(get_db),
+) -> ResearchRunDetailResponse:
+    try:
+        return create_and_run(db, project_id, session_id, payload)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/sessions/{session_id}/run/stream")
+async def create_and_run_stream_endpoint(
+    project_id: str,
+    session_id: str,
+    payload: ResearchTurnRequest,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    request_payload = {
+        "project_id": project_id,
+        "session_id": session_id,
+        "sequence_id": payload.sequence_id,
+        "user_query": payload.user_query,
+        "asset_ids": payload.asset_ids,
+        "todo_id": payload.todo_id,
+    }
+
+    def event_stream():
+        try:
+            for event in stream_research_events(
+                db,
+                TurnScopedRequest.model_validate(request_payload),
+            ):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except ValueError as exc:
+            yield json.dumps({"type": "error", "detail": str(exc)}, ensure_ascii=False) + "\n"
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            yield json.dumps({"type": "error", "detail": f"Streaming run failed: {exc}"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/sessions/{session_id}/agent/run",
+    response_model=ResearchRunDetailResponse,
+)
+async def create_agent_and_run_endpoint(
+    project_id: str,
+    session_id: str,
+    payload: ResearchTurnRequest,
+    db: Session = Depends(get_db),
+) -> ResearchRunDetailResponse:
+    try:
+        return create_agent_and_run(db, project_id, session_id, payload)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/sessions/{session_id}/agent/run/stream")
+async def create_agent_and_run_stream_endpoint(
+    project_id: str,
+    session_id: str,
+    payload: ResearchTurnRequest,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    request_payload = {
+        "project_id": project_id,
+        "session_id": session_id,
+        "sequence_id": payload.sequence_id,
+        "user_query": payload.user_query,
+        "asset_ids": payload.asset_ids,
+        "todo_id": payload.todo_id,
+    }
+
+    def event_stream():
+        try:
+            for event in stream_agent_events(
+                db,
+                TurnScopedRequest.model_validate(request_payload),
+            ):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except ValueError as exc:
+            yield json.dumps({"type": "error", "detail": str(exc)}, ensure_ascii=False) + "\n"
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            yield json.dumps({"type": "error", "detail": f"Agent streaming run failed: {exc}"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/v1/runs/{run_id}", response_model=ResearchRunDetailResponse)
+async def get_run_endpoint(run_id: str, db: Session = Depends(get_db)) -> ResearchRunDetailResponse:
+    try:
+        return get_run(db, run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/assets", response_model=list[AssetResponse])
+async def list_assets_endpoint(db: Session = Depends(get_db)) -> list[AssetResponse]:
+    return list_assets(db)
+
+
+@app.post("/api/v1/assets", response_model=AssetResponse)
+async def create_asset_endpoint(payload: AssetCreate, db: Session = Depends(get_db)) -> AssetResponse:
+    return create_asset(db, payload)
+
+
+@app.post("/api/v1/assets/upload-file", response_model=AssetResponse)
+async def upload_asset_file_endpoint(
     file: UploadFile = File(...),
-    asset_type: str = Form("note"),
     title: str | None = Form(default=None),
+    asset_type: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ) -> AssetResponse:
+    filename = file.filename or "upload"
+    started_at = perf_counter()
+    logger.info(
+        "asset_upload_started filename=%s size_hint=%s declared_type=%s title=%s",
+        filename,
+        getattr(file, "size", "unknown"),
+        asset_type or "",
+        title or "",
+    )
     raw = await file.read()
+    read_elapsed_ms = (perf_counter() - started_at) * 1000
     if not raw:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
     if len(raw) > settings.upload_max_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file exceeds size limit")
-    try:
-        payload = AssetCreate(
-            title=uploaded_asset_title(file.filename or "uploaded.txt", title),
-            asset_type=asset_type,
-            content=decode_text_content(raw),
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uploaded file exceeds {format_file_size(settings.upload_max_bytes)}",
         )
-        return create_asset(db, project_id, payload)
+    parse_started_at = perf_counter()
+    try:
+        parsed = parse_uploaded_asset(filename=filename, raw=raw, title=title, asset_type=asset_type)
     except ValueError as exc:
-        status_code = 404 if "Project not found" in str(exc) else 400
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        logger.warning(
+            "asset_upload_parse_failed filename=%s size_bytes=%s read_ms=%.1f parse_ms=%.1f detail=%s",
+            filename,
+            len(raw),
+            read_elapsed_ms,
+            (perf_counter() - parse_started_at) * 1000,
+            str(exc),
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    parse_elapsed_ms = (perf_counter() - parse_started_at) * 1000
+    save_started_at = perf_counter()
+    asset = create_asset(
+        db,
+        AssetCreate(
+            title=parsed.title,
+            asset_type=parsed.asset_type,
+            content=parsed.content,
+        ),
+    )
+    save_elapsed_ms = (perf_counter() - save_started_at) * 1000
+    total_elapsed_ms = (perf_counter() - started_at) * 1000
+    logger.info(
+        "asset_upload_completed filename=%s asset_id=%s asset_type=%s size_bytes=%s content_chars=%s read_ms=%.1f parse_ms=%.1f save_ms=%.1f total_ms=%.1f",
+        filename,
+        asset.id,
+        asset.asset_type,
+        len(raw),
+        len(parsed.content),
+        read_elapsed_ms,
+        parse_elapsed_ms,
+        save_elapsed_ms,
+        total_elapsed_ms,
+    )
+    return asset
+
+
+@app.patch("/api/v1/assets/{asset_id}", response_model=AssetResponse)
+async def update_asset_endpoint(asset_id: str, payload: AssetUpdate, db: Session = Depends(get_db)) -> AssetResponse:
+    try:
+        return update_asset(db, asset_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.delete("/api/v1/assets/{asset_id}")
-def delete_asset_endpoint(asset_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
+async def delete_asset_endpoint(asset_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
     try:
         delete_asset(db, asset_id)
         return {"status": "deleted"}
@@ -216,16 +442,8 @@ def delete_asset_endpoint(asset_id: str, db: Session = Depends(get_db)) -> dict[
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.patch("/api/v1/assets/{asset_id}", response_model=AssetResponse)
-def update_asset_endpoint(asset_id: str, payload: AssetUpdate, db: Session = Depends(get_db)) -> AssetResponse:
-    try:
-        return update_asset(db, asset_id, payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
 @app.get("/api/v1/projects/{project_id}/todos", response_model=list[TodoResponse])
-def list_todos_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[TodoResponse]:
+async def list_todos_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[TodoResponse]:
     try:
         return list_todos(db, project_id)
     except ValueError as exc:
@@ -233,7 +451,7 @@ def list_todos_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[
 
 
 @app.post("/api/v1/projects/{project_id}/todos", response_model=TodoResponse)
-def create_todo_endpoint(project_id: str, payload: TodoCreate, db: Session = Depends(get_db)) -> TodoResponse:
+async def create_todo_endpoint(project_id: str, payload: TodoCreate, db: Session = Depends(get_db)) -> TodoResponse:
     try:
         return create_todo(db, project_id, payload)
     except ValueError as exc:
@@ -241,7 +459,7 @@ def create_todo_endpoint(project_id: str, payload: TodoCreate, db: Session = Dep
 
 
 @app.patch("/api/v1/todos/{todo_id}", response_model=TodoResponse)
-def update_todo_endpoint(todo_id: str, payload: TodoUpdate, db: Session = Depends(get_db)) -> TodoResponse:
+async def update_todo_endpoint(todo_id: str, payload: TodoUpdate, db: Session = Depends(get_db)) -> TodoResponse:
     try:
         return update_todo(db, todo_id, payload)
     except ValueError as exc:
@@ -249,7 +467,7 @@ def update_todo_endpoint(todo_id: str, payload: TodoUpdate, db: Session = Depend
 
 
 @app.delete("/api/v1/todos/{todo_id}")
-def delete_todo_endpoint(todo_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
+async def delete_todo_endpoint(todo_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
     try:
         delete_todo(db, todo_id)
         return {"status": "deleted"}
@@ -258,77 +476,8 @@ def delete_todo_endpoint(todo_id: str, db: Session = Depends(get_db)) -> dict[st
 
 
 @app.get("/api/v1/projects/{project_id}/memory", response_model=list[MemoryRecordResponse])
-def list_memory_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[MemoryRecordResponse]:
+async def list_memory_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[MemoryRecordResponse]:
     try:
         return list_memory(db, project_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get("/api/v1/projects/{project_id}/runs", response_model=list[ResearchRunSummaryResponse])
-def list_runs_endpoint(project_id: str, db: Session = Depends(get_db)) -> list[ResearchRunSummaryResponse]:
-    try:
-        return list_runs(db, project_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get("/api/v1/runs/{run_id}", response_model=ResearchRunDetailResponse)
-def get_run_endpoint(run_id: str, db: Session = Depends(get_db)) -> ResearchRunDetailResponse:
-    try:
-        return get_run(db, run_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post("/api/v1/projects/{project_id}/run", response_model=ResearchRunDetailResponse)
-def create_run_endpoint(project_id: str, payload: ResearchRunRequest, db: Session = Depends(get_db)) -> ResearchRunDetailResponse:
-    try:
-        return create_and_run(db, project_id, payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post("/api/v1/runtime/build_context")
-def build_context_endpoint(payload: ProjectScopedRequest, db: Session = Depends(get_db)):
-    try:
-        project = get_project(db, payload.project_id)
-        return build_context(
-            db,
-            payload,
-            project=project,
-            assets=resolve_assets(db, payload.project_id),
-        ).model_dump()
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post("/api/v1/runtime/plan_tasks")
-def plan_tasks_endpoint(payload: ProjectScopedRequest):
-    return plan_tasks(payload).model_dump()
-
-
-@app.post("/api/v1/runtime/hybrid_retrieve")
-def hybrid_retrieve_endpoint(payload: ProjectScopedRequest, db: Session = Depends(get_db)):
-    try:
-        return hybrid_retrieve(payload, assets=resolve_assets(db, payload.project_id)).model_dump()
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post("/api/v1/runtime/answer_with_citations")
-def answer_with_citations_endpoint(payload: AnswerWithCitationsRequest):
-    return answer_with_citations(payload).model_dump()
-
-
-@app.post("/api/v1/runtime/consolidate_memory")
-def consolidate_memory_endpoint(payload: ConsolidateMemoryRequest, db: Session = Depends(get_db)):
-    return consolidate_memory(db, payload).model_dump()
-
-
-@app.post("/api/v1/runtime/research/run")
-def run_research_endpoint(payload: ProjectScopedRequest, db: Session = Depends(get_db)):
-    try:
-        return run_research(db, payload).model_dump()
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

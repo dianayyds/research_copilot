@@ -6,10 +6,26 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import jieba
-from huggingface_hub import snapshot_download
-from qdrant_client import QdrantClient, models
-from rank_bm25 import BM25Okapi
+try:
+    import jieba
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in stub tests
+    jieba = None
+
+try:
+    from huggingface_hub import snapshot_download
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in stub tests
+    snapshot_download = None
+
+try:
+    from qdrant_client import QdrantClient, models
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in stub tests
+    QdrantClient = None
+    models = None
+
+try:
+    from rank_bm25 import BM25Okapi
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in stub tests
+    BM25Okapi = None
 
 from app.config import settings
 
@@ -33,7 +49,11 @@ TOKENIZER_FILES = ["tokenizer.json", "sentencepiece.bpe.model", "spiece.model", 
 
 
 def tokenize(text: str) -> list[str]:
-    raw_tokens = [token.strip().lower() for token in jieba.cut_for_search(text) if token.strip()]
+    raw_tokens = (
+        [token.strip().lower() for token in jieba.cut_for_search(text) if token.strip()]
+        if jieba is not None
+        else [token.strip().lower() for token in re.findall(r"[\u4e00-\u9fff]+", text) if token.strip()]
+    )
     latin_tokens = re.findall(r"[a-zA-Z0-9_./-]+", text.lower())
     return list(dict.fromkeys(raw_tokens + latin_tokens))
 
@@ -51,6 +71,8 @@ def local_model_path(repo_id: str, root: Path) -> Path:
 
 
 def ensure_model_snapshot(repo_id: str, root: Path) -> str:
+    if snapshot_download is None:
+        raise RuntimeError("huggingface_hub is required for local embedding models")
     target = local_model_path(repo_id, root)
     weights = [target / name for name in WEIGHT_FILES]
     if (
@@ -76,6 +98,19 @@ def hybrid_candidate_limit(limit: int) -> int:
     return max(settings.retrieval_candidate_limit, limit * 4)
 
 
+def effective_model_max_length(
+    configured_max_length: int,
+    tokenizer_max_length: int | None,
+    model_max_positions: int | None,
+) -> int:
+    candidates = [configured_max_length]
+    if tokenizer_max_length and tokenizer_max_length < 100000:
+        candidates.append(tokenizer_max_length)
+    if model_max_positions and model_max_positions > 0:
+        candidates.append(model_max_positions)
+    return max(32, min(candidates))
+
+
 def filter_chunks(chunks: list[dict[str, Any]], asset_ids: list[str]) -> list[dict[str, Any]]:
     if not asset_ids:
         return chunks
@@ -97,6 +132,8 @@ def lexical_overlap_search(chunks: list[dict[str, Any]], query: str, limit: int)
 def bm25_search(chunks: list[dict[str, Any]], query: str, limit: int) -> list[dict[str, Any]]:
     if not chunks:
         return []
+    if BM25Okapi is None:
+        return lexical_overlap_search(chunks, query, limit)
     bm25 = BM25Okapi([bm25_tokens(chunk["content"]) for chunk in chunks])
     scores = bm25.get_scores(bm25_tokens(query))
     ranked = [
@@ -143,19 +180,18 @@ class StubVectorStore:
     def reset(self) -> None:
         self.chunks.clear()
 
-    def upsert_chunks(self, project_id: str, chunks: list[dict[str, str]]) -> None:
+    def upsert_chunks(self, chunks: list[dict[str, str]]) -> None:
         for chunk in chunks:
-            self.chunks[chunk["chunk_id"]] = {**chunk, "project_id": project_id}
+            self.chunks[chunk["chunk_id"]] = dict(chunk)
 
     def delete_asset(self, asset_id: str) -> None:
         self.chunks = {key: value for key, value in self.chunks.items() if value["asset_id"] != asset_id}
 
     def delete_project(self, project_id: str) -> None:
-        self.chunks = {key: value for key, value in self.chunks.items() if value["project_id"] != project_id}
+        return None
 
     def search(
         self,
-        project_id: str,
         query: str,
         limit: int,
         asset_ids: list[str],
@@ -220,6 +256,11 @@ class BgeReranker:
         self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
         self.model.to(self.device)
         self.model.eval()
+        self.max_length = effective_model_max_length(
+            settings.reranker_max_length,
+            getattr(self.tokenizer, "model_max_length", None),
+            getattr(self.model.config, "max_position_embeddings", None),
+        )
 
     def score(self, query: str, passages: list[str]) -> list[float]:
         if not passages:
@@ -232,7 +273,7 @@ class BgeReranker:
                 batch_pairs,
                 padding=True,
                 truncation=True,
-                max_length=settings.reranker_max_length,
+                max_length=self.max_length,
                 return_tensors="pt",
             )
             batch = {key: value.to(self.device) for key, value in batch.items()}
@@ -244,6 +285,8 @@ class BgeReranker:
 
 class QdrantVectorStore:
     def __init__(self) -> None:
+        if QdrantClient is None or models is None:
+            raise RuntimeError("qdrant_client is required when VECTOR_STORE_PROVIDER=qdrant")
         self.client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         self._embedder: BgeM3Embedder | None = None
         self._reranker: BgeReranker | None = None
@@ -271,7 +314,7 @@ class QdrantVectorStore:
             ),
         )
 
-    def upsert_chunks(self, project_id: str, chunks: list[dict[str, str]]) -> None:
+    def upsert_chunks(self, chunks: list[dict[str, str]]) -> None:
         self.ensure_collection()
         if not chunks:
             return
@@ -280,7 +323,7 @@ class QdrantVectorStore:
             models.PointStruct(
                 id=point_id(chunk["chunk_id"]),
                 vector=vector,
-                payload={**chunk, "project_id": project_id},
+                payload=dict(chunk),
             )
             for chunk, vector in zip(chunks, vectors, strict=False)
         ]
@@ -320,20 +363,9 @@ class QdrantVectorStore:
             wait=True,
         )
 
-    def dense_search(
-        self,
-        project_id: str,
-        query: str,
-        limit: int,
-        asset_ids: list[str],
-    ) -> list[dict[str, Any]]:
+    def dense_search(self, query: str, limit: int, asset_ids: list[str]) -> list[dict[str, Any]]:
         self.ensure_collection()
-        must_conditions: list[models.Condition] = [
-            models.FieldCondition(
-                key="project_id",
-                match=models.MatchValue(value=project_id),
-            )
-        ]
+        must_conditions: list[models.Condition] = []
         if asset_ids:
             must_conditions.append(
                 models.FieldCondition(
@@ -361,7 +393,6 @@ class QdrantVectorStore:
 
     def search(
         self,
-        project_id: str,
         query: str,
         limit: int,
         asset_ids: list[str],
@@ -371,7 +402,7 @@ class QdrantVectorStore:
         corpus = filter_chunks(chunks, asset_ids)
         if not corpus:
             return []
-        dense_hits = self.dense_search(project_id, query, candidate_limit, asset_ids)
+        dense_hits = self.dense_search(query, candidate_limit, asset_ids)
         sparse_hits = bm25_search(corpus, query, candidate_limit)
         fused_hits = merge_rankings(dense_hits, sparse_hits, candidate_limit)
         return self.rerank(query, fused_hits, limit)

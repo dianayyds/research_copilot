@@ -1,38 +1,36 @@
+const WORKSPACE_TITLES = ["__workspace__", "Workspace"];
+const WORKSPACE_CREATE_TITLE = "__workspace__";
+const WORKSPACE_DESCRIPTION = "Hidden default workspace";
+
 const state = {
-  projects: [],
-  selectedProjectId: "",
-  assets: [],
-  todos: [],
+  workspaceProjectId: "",
+  sessions: [],
+  selectedSessionId: "",
   runs: [],
-  memory: [],
-  config: null,
-  dashboard: null,
-  currentRun: null,
+  streamingRun: null,
+  assets: [],
+  assetDrawerOpen: false,
+  agentMode: false,
 };
 
-const projectListEl = document.getElementById("project-list");
-const assetListEl = document.getElementById("asset-list");
-const todoListEl = document.getElementById("todo-list");
-const runListEl = document.getElementById("run-list");
-const memoryListEl = document.getElementById("memory-list");
-const dashboardEl = document.getElementById("dashboard");
-const providerConfigEl = document.getElementById("provider-config");
-const projectTitleEl = document.getElementById("project-title");
-const projectDescriptionEl = document.getElementById("project-description");
-const runResultEl = document.getElementById("run-result");
-const runStatusEl = document.getElementById("run-status");
-const runDetailModalEl = document.getElementById("run-detail-modal");
-const runDetailBodyEl = document.getElementById("run-detail-body");
-const runDetailTitleEl = document.getElementById("run-detail-title");
-const runDetailCloseButton = document.getElementById("run-detail-close");
-
-const projectForm = document.getElementById("project-form");
+const sessionListEl = document.getElementById("session-list");
+const chatTitleEl = document.getElementById("chat-title");
+const chatStreamEl = document.getElementById("chat-stream");
+const sequenceHintEl = document.getElementById("sequence-hint");
+const composerForm = document.getElementById("composer-form");
+const composerQueryEl = document.getElementById("composer-query");
+const composerSubmitEl = document.getElementById("composer-submit");
+const agentModeToggleEl = document.getElementById("agent-mode-toggle");
+const newSessionButton = document.getElementById("new-session-button");
+const assetToggleButton = document.getElementById("asset-toggle-button");
+const assetCloseButton = document.getElementById("asset-close-button");
+const assetBackdropEl = document.getElementById("asset-backdrop");
+const assetDrawerEl = document.getElementById("asset-drawer");
 const assetForm = document.getElementById("asset-form");
-const assetUploadForm = document.getElementById("asset-upload-form");
 const assetResetButton = document.getElementById("asset-reset");
-const todoForm = document.getElementById("todo-form");
-const todoResetButton = document.getElementById("todo-reset");
-const runForm = document.getElementById("run-form");
+const assetUploadForm = document.getElementById("asset-upload-form");
+const assetListEl = document.getElementById("asset-list");
+const assetUploadSubmitEl = assetUploadForm.querySelector('button[type="submit"]');
 
 async function request(url, options = {}) {
   const isFormData = options.body instanceof FormData;
@@ -44,205 +42,50 @@ async function request(url, options = {}) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.detail || `Request failed: ${response.status}`);
   }
+  if (response.status === 204) {
+    return null;
+  }
   return response.json();
 }
 
-function badgeClass(status) {
-  return status === "done" || status === "active" ? "badge success" : "badge warn";
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
-function selectedProject() {
-  return state.projects.find((project) => project.id === state.selectedProjectId) || null;
+function renderText(value) {
+  return escapeHtml(value).replaceAll("\n", "<br />");
 }
 
-function emptyCard(message) {
-  return `<div class="empty">${message}</div>`;
+function formatTime(value) {
+  const date = new Date(value);
+  return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(
+    date.getMinutes(),
+  ).padStart(2, "0")}`;
 }
 
-function runDetailMarkup(run) {
-  const planItems = run.plan.tasks.map((task) => `<li>${task.title}: ${task.goal}</li>`).join("");
-  const evidenceItems = run.retrieval.evidence_items
-    .map((item) => `<li>[${item.label}] ${item.title}: ${item.snippet}</li>`)
-    .join("");
-  const memoryItems = run.memory.memory_updates
-    .map((item) => `<li>${item.memory_type}.${item.key}: ${item.value}</li>`)
-    .join("");
-  return `
-    <article class="result-card">
-      <h3>任务</h3>
-      <p><strong>问题：</strong>${run.query}</p>
-      <p class="muted"><strong>状态：</strong>${run.status} · <strong>时间：</strong>${new Date(run.created_at).toLocaleString()}</p>
-    </article>
-    <article class="result-card">
-      <h3>答案</h3>
-      <pre>${run.answer.answer}</pre>
-    </article>
-    <article class="result-card">
-      <h3>执行计划</h3>
-      <ol>${planItems}</ol>
-    </article>
-    <article class="result-card">
-      <h3>引用证据</h3>
-      <ol>${evidenceItems || "<li>暂无证据</li>"}</ol>
-    </article>
-    <article class="result-card">
-      <h3>记忆更新</h3>
-      <ul>${memoryItems || "<li>暂无记忆更新</li>"}</ul>
-    </article>
-  `;
+function selectedSession() {
+  return state.sessions.find((session) => session.id === state.selectedSessionId) || null;
 }
 
-function openRunModal(run) {
-  state.currentRun = run;
-  runDetailTitleEl.textContent = "运行详情";
-  runDetailBodyEl.innerHTML = runDetailMarkup(run);
-  runDetailModalEl.hidden = false;
-  document.body.classList.add("modal-open");
+function visibleRuns() {
+  return state.streamingRun && state.streamingRun.session_id === state.selectedSessionId
+    ? [...state.runs, state.streamingRun]
+    : state.runs;
 }
 
-function closeRunModal() {
-  runDetailModalEl.hidden = true;
-  document.body.classList.remove("modal-open");
+function nextSequenceId() {
+  return (selectedSession()?.last_sequence_id || 0) + 1;
 }
 
-function renderDashboard() {
-  const dashboard = state.dashboard;
-  if (!dashboard) {
-    dashboardEl.innerHTML = emptyCard("暂无数据");
-    return;
-  }
-  const cards = [
-    ["项目", dashboard.project_count],
-    ["TODO", dashboard.todo_count],
-    ["未完成", dashboard.open_todo_count],
-    ["运行", dashboard.run_count],
-  ];
-  dashboardEl.innerHTML = cards
-    .map(([label, value]) => `<div class="stat-card"><span>${label}</span><strong>${value}</strong></div>`)
-    .join("");
-}
-
-function renderProviderConfig() {
-  if (!state.config) {
-    providerConfigEl.innerHTML = "";
-    return;
-  }
-  providerConfigEl.innerHTML = [
-    `<div><strong>LLM</strong>: ${state.config.llm.provider} / ${state.config.llm.model}</div>`,
-    `<div><strong>Embedding</strong>: ${state.config.embedding.provider} / ${state.config.embedding.model}</div>`,
-    `<div><strong>Reranker</strong>: ${state.config.reranker.provider} / ${state.config.reranker.model}</div>`,
-    `<div><strong>Mode</strong>: ${state.config.execution_mode}</div>`,
-  ].join("");
-}
-
-function renderProjects() {
-  if (!state.projects.length) {
-    projectListEl.innerHTML = emptyCard("先创建一个项目。");
-    return;
-  }
-  projectListEl.innerHTML = state.projects
-    .map(
-      (project) => `
-        <article class="list-item project-card ${project.id === state.selectedProjectId ? "active" : ""}">
-          <p class="item-title">${project.title}</p>
-          <p class="muted">${project.description || "暂无描述"}</p>
-          <div class="item-meta">
-            <span class="badge">${project.asset_count} 资产</span>
-            <span class="badge">${project.todo_count} TODO</span>
-            <span class="badge">${project.run_count} 运行</span>
-          </div>
-          <div class="project-card-actions">
-            <button class="ghost" data-project-id="${project.id}">打开</button>
-            <button class="danger" data-delete-project="${project.id}">删除</button>
-          </div>
-        </article>
-      `,
-    )
-    .join("");
-  projectListEl.querySelectorAll("[data-project-id]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      closeRunModal();
-      state.selectedProjectId = button.dataset.projectId;
-      await hydrateProjectWorkspace();
-      renderAll();
-    });
-  });
-  projectListEl.querySelectorAll("[data-delete-project]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const projectId = button.dataset.deleteProject;
-      const project = state.projects.find((item) => item.id === projectId);
-      if (!project || !confirm(`删除项目「${project.title}」及其资产、TODO、运行记录和记忆？`)) {
-        return;
-      }
-      closeRunModal();
-      await request(`/api/v1/projects/${projectId}`, { method: "DELETE" });
-      state.selectedProjectId =
-        state.selectedProjectId === projectId
-          ? state.projects.find((item) => item.id !== projectId)?.id || ""
-          : state.selectedProjectId;
-      await hydrateDashboard();
-      await loadProjects();
-      await hydrateProjectWorkspace();
-      renderAll();
-    });
-  });
-}
-
-function renderProjectHeader() {
-  const project = selectedProject();
-  projectTitleEl.textContent = project ? project.title : "选择一个项目开始";
-  projectDescriptionEl.textContent = project
-    ? project.description || "项目已创建，可以继续补充知识资产与 TODO。"
-    : "可以先创建项目，再补充资产、TODO 和研究请求。";
-}
-
-function renderAssets() {
-  if (!state.selectedProjectId) {
-    assetListEl.innerHTML = emptyCard("选择项目后再添加资产。");
-    return;
-  }
-  if (!state.assets.length) {
-    assetListEl.innerHTML = emptyCard("暂无资产。可以先粘贴论文摘要、代码说明或笔记。");
-    return;
-  }
-  assetListEl.innerHTML = state.assets
-    .map(
-      (asset) => `
-        <article class="list-item">
-          <p class="item-title">${asset.title}</p>
-          <div class="item-meta">
-            <span class="badge">${asset.asset_type}</span>
-          </div>
-          <p class="muted">${asset.content}</p>
-          <div class="actions">
-            <button class="ghost" data-edit-asset="${asset.id}">编辑</button>
-            <button class="ghost" data-delete-asset="${asset.id}">删除</button>
-          </div>
-        </article>
-      `,
-    )
-    .join("");
-  assetListEl.querySelectorAll("[data-edit-asset]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const asset = state.assets.find((item) => item.id === button.dataset.editAsset);
-      if (asset) fillAssetForm(asset);
-    });
-  });
-  assetListEl.querySelectorAll("[data-delete-asset]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await request(`/api/v1/assets/${button.dataset.deleteAsset}`, { method: "DELETE" });
-      await hydrateProjectWorkspace();
-      renderAll();
-    });
-  });
-}
-
-function fillTodoForm(todo) {
-  todoForm.todo_id.value = todo.id;
-  todoForm.title.value = todo.title;
-  todoForm.description.value = todo.description;
-  todoForm.priority.value = todo.priority;
-  todoForm.status.value = todo.status;
+function resetAssetForm() {
+  assetForm.reset();
+  assetForm.asset_id.value = "";
+  assetForm.asset_type.value = "note";
 }
 
 function fillAssetForm(asset) {
@@ -252,318 +95,547 @@ function fillAssetForm(asset) {
   assetForm.content.value = asset.content;
 }
 
-function resetAssetForm() {
-  assetForm.reset();
-  assetForm.asset_id.value = "";
-  assetForm.asset_type.value = "note";
+function adjustComposerHeight() {
+  composerQueryEl.style.height = "0px";
+  composerQueryEl.style.height = `${Math.min(composerQueryEl.scrollHeight, 220)}px`;
 }
 
-function resetTodoForm() {
-  todoForm.reset();
-  todoForm.todo_id.value = "";
-  todoForm.priority.value = "medium";
-  todoForm.status.value = "todo";
+function setSubmitting(isSubmitting) {
+  composerQueryEl.disabled = isSubmitting;
+  composerSubmitEl.disabled = isSubmitting;
+  agentModeToggleEl.disabled = isSubmitting;
+  composerSubmitEl.innerHTML = `<span>${isSubmitting ? "…" : "↑"}</span>`;
 }
 
-function renderTodos() {
-  if (!state.selectedProjectId) {
-    todoListEl.innerHTML = emptyCard("选择项目后再维护 TODO。");
+function scrollChatToBottom() {
+  chatStreamEl.scrollTop = chatStreamEl.scrollHeight;
+}
+
+function toggleAssetDrawer(forceOpen) {
+  state.assetDrawerOpen = typeof forceOpen === "boolean" ? forceOpen : !state.assetDrawerOpen;
+  assetDrawerEl.hidden = !state.assetDrawerOpen;
+  assetBackdropEl.hidden = !state.assetDrawerOpen;
+  assetToggleButton.classList.toggle("active", state.assetDrawerOpen);
+  document.body.classList.toggle("drawer-open", state.assetDrawerOpen);
+}
+
+function renderHeader() {
+  const session = selectedSession();
+  chatTitleEl.textContent = session ? session.title : "新对话";
+  sequenceHintEl.textContent = `${state.agentMode ? "Agent" : "Research"} · 下一轮 #${nextSequenceId()}`;
+  agentModeToggleEl.checked = state.agentMode;
+}
+
+function renderSessions() {
+  if (!state.sessions.length) {
+    sessionListEl.innerHTML = `<div class="empty-list">还没有对话</div>`;
     return;
   }
-  if (!state.todos.length) {
-    todoListEl.innerHTML = emptyCard("暂无 TODO。可以先定义研究任务。");
-    return;
-  }
-  todoListEl.innerHTML = state.todos
+
+  sessionListEl.innerHTML = state.sessions
     .map(
-      (todo) => `
-        <article class="list-item">
-          <p class="item-title">${todo.title}</p>
-          <p class="muted">${todo.description || "暂无描述"}</p>
-          <div class="item-meta">
-            <span class="${badgeClass(todo.status)}">${todo.status}</span>
-            <span class="badge">${todo.priority}</span>
-          </div>
-          <div class="actions">
-            <button class="ghost" data-edit-todo="${todo.id}">编辑</button>
-            <button data-run-todo="${todo.id}">执行</button>
-            <button class="danger" data-delete-todo="${todo.id}">删除</button>
-          </div>
+      (session) => `
+        <article class="session-item ${session.id === state.selectedSessionId ? "active" : ""}">
+          <button class="session-trigger" type="button" data-session-id="${session.id}">
+            <span class="session-name">${escapeHtml(session.title)}</span>
+            <span class="session-meta">${escapeHtml(session.summary || formatTime(session.updated_at))}</span>
+          </button>
+          <button class="session-delete" type="button" data-delete-session="${session.id}" aria-label="删除会话">
+            ×
+          </button>
         </article>
       `,
     )
     .join("");
-  todoListEl.querySelectorAll("[data-edit-todo]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const todo = state.todos.find((item) => item.id === button.dataset.editTodo);
-      if (todo) fillTodoForm(todo);
+
+  sessionListEl.querySelectorAll("[data-session-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      state.selectedSessionId = button.dataset.sessionId;
+      await loadSessionRuns();
+      renderAll();
+      scrollChatToBottom();
     });
   });
-  todoListEl.querySelectorAll("[data-delete-todo]").forEach((button) => {
+
+  sessionListEl.querySelectorAll("[data-delete-session]").forEach((button) => {
     button.addEventListener("click", async () => {
-      await request(`/api/v1/todos/${button.dataset.deleteTodo}`, { method: "DELETE" });
-      await hydrateProjectWorkspace();
+      const session = state.sessions.find((item) => item.id === button.dataset.deleteSession);
+      if (!session || !confirm(`删除会话「${session.title}」？`)) {
+        return;
+      }
+      await request(`/api/v1/projects/${state.workspaceProjectId}/sessions/${session.id}`, { method: "DELETE" });
+      if (state.selectedSessionId === session.id) {
+        state.selectedSessionId = "";
+      }
+      await loadSessions();
+      await loadSessionRuns();
       renderAll();
     });
   });
-  todoListEl.querySelectorAll("[data-run-todo]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const todo = state.todos.find((item) => item.id === button.dataset.runTodo);
-      if (todo) await runResearch({ user_query: todo.description || todo.title, todo_id: todo.id });
-    });
-  });
 }
 
-function renderRuns() {
-  if (!state.selectedProjectId) {
-    runListEl.innerHTML = emptyCard("选择项目后查看运行记录。");
-    return;
-  }
-  if (!state.runs.length) {
-    runListEl.innerHTML = emptyCard("暂无运行记录。");
-    return;
-  }
-  runListEl.innerHTML = state.runs
-    .map(
-      (run) => `
-        <article class="list-item">
-          <p class="item-title">${run.query}</p>
-          <p class="muted">${run.answer_preview || "暂无答案"}</p>
-          <div class="item-meta">
-            <span class="${badgeClass(run.status)}">${run.status}</span>
-            <span class="badge">${new Date(run.created_at).toLocaleString()}</span>
-          </div>
-          <div class="actions">
-            <button class="ghost" data-run-detail="${run.id}">查看详情</button>
-          </div>
-        </article>
-      `,
-    )
-    .join("");
-  runListEl.querySelectorAll("[data-run-detail]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      openRunModal(await request(`/api/v1/runs/${button.dataset.runDetail}`));
-    });
-  });
-}
-
-function renderMemory() {
-  if (!state.selectedProjectId) {
-    memoryListEl.innerHTML = emptyCard("选择项目后查看长期记忆。");
-    return;
-  }
-  if (!state.memory.length) {
-    memoryListEl.innerHTML = emptyCard("暂无长期记忆。完成第一次运行后会自动沉淀。");
-    return;
-  }
-  memoryListEl.innerHTML = state.memory
-    .map(
-      (item) => `
-        <article class="list-item">
-          <p class="item-title">${item.memory_type}.${item.memory_key}</p>
-          <p class="muted">${item.memory_value}</p>
-        </article>
-      `,
-    )
-    .join("");
-}
-
-function renderRunResult() {
-  const latest = state.runs[0];
-  if (!latest) {
-    runResultEl.innerHTML = emptyCard("执行完成后，请到右侧运行记录点击“查看详情”，系统会以弹窗方式展示结果。");
-    return;
-  }
-  runResultEl.innerHTML = `
-    <div class="empty">
-      最新运行已保存到右侧“运行记录”。
-      点击“查看详情”会以弹窗展示答案、计划、引用和记忆更新。
+function renderWelcome() {
+  const session = selectedSession();
+  return `
+    <div class="welcome">
+      <h1>${session ? escapeHtml(session.title) : "今天想处理什么？"}</h1>
+      <p>${session ? "直接继续这个对话，或在下方输入新的业务。" : "新建一个会话，或者直接在下方输入任务。"}</p>
     </div>
   `;
 }
 
-function renderAll() {
-  renderDashboard();
-  renderProviderConfig();
-  renderProjects();
-  renderProjectHeader();
-  renderAssets();
-  renderTodos();
-  renderRuns();
-  renderMemory();
-  renderRunResult();
+function renderCitations(citations) {
+  if (!citations.length) {
+    return "";
+  }
+  return `
+    <div class="citation-list">
+      ${citations
+        .map(
+          (citation) => `
+            <span class="citation-chip">
+              <span>来源</span>
+              <span>${escapeHtml(citation.label)}</span>
+            </span>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
 }
 
-async function loadProjects() {
-  state.projects = await request("/api/v1/projects");
-  state.selectedProjectId = state.selectedProjectId || state.projects[0]?.id || "";
+function renderExecutionTrace(run) {
+  const plan = run.plan || {};
+  const steps = plan.execution_trace || [];
+  const summary = plan.solver_summary || "";
+  const planSummary = plan.plan_summary || "";
+  const replanLabel = plan.replan_count ? `重规划 ${plan.replan_count} 次` : run.status === "streaming" ? "思考中" : "已完成";
+  if (!steps.length && !summary && !planSummary && run.status !== "streaming") {
+    return "";
+  }
+  return `
+    <div class="thinking-card ${run.status === "streaming" ? "is-streaming" : ""}">
+      <div class="thinking-header">
+        <div class="thinking-title">执行轨迹</div>
+        <div class="thinking-state">${escapeHtml(replanLabel)}</div>
+      </div>
+      <div class="thinking-plan">${escapeHtml(planSummary || "正在规划执行路径…")}</div>
+      ${
+        steps.length
+          ? `
+            <div class="trace-list">
+              ${steps
+                .map(
+                  (step) => `
+                    <div class="trace-item">
+                      <span class="trace-action">${escapeHtml(step.action)}</span>
+                      <div class="trace-content">
+                        <strong>${escapeHtml(step.title)}</strong>
+                        <span>${escapeHtml(step.summary)}</span>
+                      </div>
+                    </div>
+                  `,
+                )
+                .join("")}
+            </div>
+          `
+          : `<div class="thinking-placeholder">正在生成执行步骤…</div>`
+      }
+      ${
+        summary
+          ? `<div class="solver-summary"><strong>Solver 总结：</strong>${escapeHtml(summary)}</div>`
+          : ""
+      }
+    </div>
+  `;
 }
 
-async function hydrateProjectWorkspace() {
-  if (!state.selectedProjectId) {
-    state.assets = [];
-    state.todos = [];
-    state.runs = [];
-    state.memory = [];
-    state.currentRun = null;
+function renderChat() {
+  const runs = visibleRuns();
+  if (!runs.length) {
+    chatStreamEl.innerHTML = renderWelcome();
     return;
   }
-  const [assets, todos, runs, memory] = await Promise.all([
-    request(`/api/v1/projects/${state.selectedProjectId}/assets`),
-    request(`/api/v1/projects/${state.selectedProjectId}/todos`),
-    request(`/api/v1/projects/${state.selectedProjectId}/runs`),
-    request(`/api/v1/projects/${state.selectedProjectId}/memory`),
-  ]);
-  state.assets = assets;
-  state.todos = todos;
-  state.runs = runs;
-  state.memory = memory;
+
+  chatStreamEl.innerHTML = runs
+    .map(
+      (run) => `
+        <section class="message-group">
+          <div class="user-row">
+            <div class="user-bubble">${renderText(run.query)}</div>
+          </div>
+          <div class="assistant-row">
+            <div class="assistant-avatar">AI</div>
+            <div class="assistant-block">
+              ${renderExecutionTrace(run)}
+              <div class="assistant-body">
+                ${renderText(run.answer?.answer || (run.status === "streaming" ? "正在整理答案…" : ""))}
+                ${run.status === "streaming" ? '<span class="stream-caret"></span>' : ""}
+              </div>
+              ${renderCitations(run.answer?.citations || [])}
+            </div>
+          </div>
+        </section>
+      `,
+    )
+    .join("");
 }
 
-async function hydrateDashboard() {
-  state.dashboard = await request("/api/v1/dashboard");
-}
-
-async function hydrateConfig() {
-  state.config = await request("/api/v1/config/providers");
-}
-
-async function runResearch(payload) {
-  if (!state.selectedProjectId) {
-    alert("请先创建或选择项目。");
+function renderAssets() {
+  if (!state.assets.length) {
+    assetListEl.innerHTML = `<div class="empty-list">还没有资产</div>`;
     return;
   }
-  runStatusEl.textContent = "正在执行 plan-and-solve 任务...";
-  const run = await request(`/api/v1/projects/${state.selectedProjectId}/run`, {
-    method: "POST",
-    body: JSON.stringify(payload),
+
+  assetListEl.innerHTML = state.assets
+    .map(
+      (asset) => `
+        <article class="asset-item">
+          <div class="asset-item-head">
+            <strong>${escapeHtml(asset.title)}</strong>
+            <span class="asset-item-type">${escapeHtml(asset.asset_type)}</span>
+          </div>
+          <p>${escapeHtml(asset.content.slice(0, 180))}</p>
+          <div class="asset-item-actions">
+            <button class="ghost-button" type="button" data-edit-asset="${asset.id}">编辑</button>
+            <button class="ghost-button danger-button" type="button" data-delete-asset="${asset.id}">删除</button>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+
+  assetListEl.querySelectorAll("[data-edit-asset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const asset = state.assets.find((item) => item.id === button.dataset.editAsset);
+      if (!asset) {
+        return;
+      }
+      fillAssetForm(asset);
+      toggleAssetDrawer(true);
+    });
   });
-  state.currentRun = run;
-  runStatusEl.textContent = "执行完成";
-  await hydrateDashboard();
-  await loadProjects();
-  await hydrateProjectWorkspace();
-  renderAll();
-  openRunModal(run);
+
+  assetListEl.querySelectorAll("[data-delete-asset]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await request(`/api/v1/assets/${button.dataset.deleteAsset}`, { method: "DELETE" });
+      await loadAssets();
+      renderAssets();
+    });
+  });
 }
 
-projectForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const formData = new FormData(projectForm);
-  await request("/api/v1/projects", {
+function renderAll() {
+  renderHeader();
+  renderSessions();
+  renderChat();
+  renderAssets();
+  adjustComposerHeight();
+}
+
+async function ensureWorkspaceProject() {
+  const projects = await request("/api/v1/projects");
+  const existing = projects.find((project) => WORKSPACE_TITLES.includes(project.title));
+  if (existing) {
+    state.workspaceProjectId = existing.id;
+    return;
+  }
+
+  const workspace = await request("/api/v1/projects", {
     method: "POST",
     body: JSON.stringify({
-      title: formData.get("title"),
-      description: formData.get("description") || "",
+      title: WORKSPACE_CREATE_TITLE,
+      description: WORKSPACE_DESCRIPTION,
       status: "active",
     }),
   });
-  projectForm.reset();
-  await hydrateDashboard();
-  await loadProjects();
-  await hydrateProjectWorkspace();
+  state.workspaceProjectId = workspace.id;
+}
+
+async function loadSessions() {
+  if (!state.workspaceProjectId) {
+    state.sessions = [];
+    state.selectedSessionId = "";
+    return;
+  }
+  state.sessions = await request(`/api/v1/projects/${state.workspaceProjectId}/sessions`);
+  state.selectedSessionId =
+    state.sessions.find((session) => session.id === state.selectedSessionId)?.id || state.sessions[0]?.id || "";
+}
+
+async function loadSessionRuns() {
+  if (!state.workspaceProjectId || !state.selectedSessionId) {
+    state.runs = [];
+    return;
+  }
+  state.runs = await request(`/api/v1/projects/${state.workspaceProjectId}/sessions/${state.selectedSessionId}/runs`);
+}
+
+async function loadAssets() {
+  state.assets = await request("/api/v1/assets");
+}
+
+async function initializeWorkspace() {
+  await ensureWorkspaceProject();
+  await Promise.all([loadSessions(), loadAssets()]);
+  await loadSessionRuns();
+}
+
+async function createSession() {
+  if (!state.workspaceProjectId) {
+    return;
+  }
+  const session = await request(`/api/v1/projects/${state.workspaceProjectId}/sessions`, {
+    method: "POST",
+    body: JSON.stringify({ title: "新会话" }),
+  });
+  state.selectedSessionId = session.id;
+  await loadSessions();
+  state.selectedSessionId = session.id;
+  await loadSessionRuns();
   renderAll();
+  composerQueryEl.focus();
+}
+
+function createStreamingRun(query, sessionId, sequenceId) {
+  return {
+    id: `stream-${Date.now()}`,
+    session_id: sessionId,
+    sequence_id: sequenceId,
+    query,
+    status: "streaming",
+    answer: { answer: "", citations: [] },
+    plan: {
+      planner_mode: state.agentMode ? "agent_loop" : "two_stage",
+      plan_summary: "",
+      tasks: [],
+      execution_trace: [],
+      solver_summary: "",
+      replan_count: 0,
+      replan_reason: "",
+    },
+  };
+}
+
+async function streamRequest(url, payload, onEvent) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorPayload = await response.json().catch(() => ({}));
+    throw new Error(errorPayload.detail || `Request failed: ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error("当前浏览器不支持流式响应。");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      await onEvent(JSON.parse(trimmed));
+    }
+  }
+  if (buffer.trim()) {
+    await onEvent(JSON.parse(buffer.trim()));
+  }
+}
+
+async function runTurn(query) {
+  const prompt = query.trim();
+  if (!prompt) {
+    return;
+  }
+
+  if (!state.selectedSessionId) {
+    await createSession();
+  }
+
+  const sequenceId = nextSequenceId();
+  setSubmitting(true);
+  try {
+    composerForm.reset();
+    adjustComposerHeight();
+    state.streamingRun = createStreamingRun(prompt, state.selectedSessionId, sequenceId);
+    renderAll();
+    scrollChatToBottom();
+    const runPath = state.agentMode ? "agent/run/stream" : "run/stream";
+    await streamRequest(`/api/v1/projects/${state.workspaceProjectId}/sessions/${state.selectedSessionId}/${runPath}`, {
+      user_query: prompt,
+      asset_ids: [],
+      sequence_id: sequenceId,
+    }, async (event) => {
+      if (!state.streamingRun) {
+        return;
+      }
+      if (event.type === "plan" && event.plan) {
+        state.streamingRun.plan = { ...state.streamingRun.plan, ...event.plan };
+      }
+      if (event.type === "trace" && event.step) {
+        state.streamingRun.plan.execution_trace = [...state.streamingRun.plan.execution_trace, event.step];
+      }
+      if (event.type === "solver_summary") {
+        state.streamingRun.plan.solver_summary = event.solver_summary || "";
+        state.streamingRun.plan.replan_count = event.replan_count || 0;
+        state.streamingRun.plan.replan_reason = event.replan_reason || "";
+      }
+      if (event.type === "answer_delta") {
+        state.streamingRun.answer.answer = event.answer || `${state.streamingRun.answer.answer}${event.delta || ""}`;
+      }
+      if (event.type === "complete") {
+        await loadSessions();
+        await loadSessionRuns();
+        state.streamingRun = null;
+      }
+      if (event.type === "error") {
+        throw new Error(event.detail || "流式执行失败");
+      }
+      renderAll();
+      scrollChatToBottom();
+    });
+  } catch (error) {
+    state.streamingRun = null;
+    renderAll();
+    alert(error.message);
+  } finally {
+    setSubmitting(false);
+  }
+}
+
+newSessionButton.addEventListener("click", async () => {
+  await createSession();
+});
+
+assetToggleButton.addEventListener("click", () => {
+  toggleAssetDrawer();
+});
+
+agentModeToggleEl.addEventListener("change", () => {
+  state.agentMode = agentModeToggleEl.checked;
+  renderHeader();
+});
+
+assetCloseButton.addEventListener("click", () => {
+  toggleAssetDrawer(false);
+});
+
+assetBackdropEl.addEventListener("click", () => {
+  toggleAssetDrawer(false);
+});
+
+assetResetButton.addEventListener("click", () => {
+  resetAssetForm();
 });
 
 assetForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!state.selectedProjectId) {
-    alert("请先选择项目。");
-    return;
+  try {
+    const formData = new FormData(assetForm);
+    const assetId = String(formData.get("asset_id") || "");
+    const url = assetId ? `/api/v1/assets/${assetId}` : "/api/v1/assets";
+    const method = assetId ? "PATCH" : "POST";
+    await request(url, {
+      method,
+      body: JSON.stringify({
+        title: String(formData.get("title") || "").trim(),
+        asset_type: formData.get("asset_type"),
+        content: String(formData.get("content") || "").trim(),
+      }),
+    });
+    resetAssetForm();
+    await loadAssets();
+    renderAssets();
+  } catch (error) {
+    alert(error.message);
   }
-  const formData = new FormData(assetForm);
-  const assetId = formData.get("asset_id");
-  const url = assetId ? `/api/v1/assets/${assetId}` : `/api/v1/projects/${state.selectedProjectId}/assets`;
-  await request(url, {
-    method: assetId ? "PATCH" : "POST",
-    body: JSON.stringify({
-      title: formData.get("title"),
-      asset_type: formData.get("asset_type"),
-      content: formData.get("content"),
-    }),
-  });
-  resetAssetForm();
-  await hydrateDashboard();
-  await loadProjects();
-  await hydrateProjectWorkspace();
-  renderAll();
 });
-
-assetResetButton.addEventListener("click", resetAssetForm);
 
 assetUploadForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!state.selectedProjectId) {
-    alert("请先选择项目。");
-    return;
+  try {
+    const formData = new FormData(assetUploadForm);
+    const file = formData.get("file");
+    if (!(file instanceof File) || !file.size) {
+      alert("请选择一个文件。");
+      return;
+    }
+    const uploadStartedAt = performance.now();
+    console.info("[asset-upload] start", {
+      filename: file.name,
+      size_bytes: file.size,
+      mime_type: file.type || "unknown",
+      asset_type: String(formData.get("asset_type") || ""),
+    });
+    assetUploadSubmitEl.disabled = true;
+    assetUploadSubmitEl.textContent = "导入中...";
+    const uploadBody = new FormData();
+    uploadBody.append("file", file);
+    uploadBody.append("title", String(formData.get("upload_title") || "").trim());
+    uploadBody.append("asset_type", String(formData.get("asset_type") || ""));
+    const asset = await request("/api/v1/assets/upload-file", {
+      method: "POST",
+      body: uploadBody,
+    });
+    console.info("[asset-upload] complete", {
+      filename: file.name,
+      asset_id: asset.id,
+      asset_type: asset.asset_type,
+      elapsed_ms: Math.round(performance.now() - uploadStartedAt),
+    });
+    assetUploadForm.reset();
+    await loadAssets();
+    renderAssets();
+  } catch (error) {
+    console.error("[asset-upload] failed", error);
+    alert(error.message);
+  } finally {
+    assetUploadSubmitEl.disabled = false;
+    assetUploadSubmitEl.textContent = "导入文件";
   }
-  const formData = new FormData(assetUploadForm);
-  await request(`/api/v1/projects/${state.selectedProjectId}/assets/upload-text`, {
-    method: "POST",
-    body: formData,
-  });
-  assetUploadForm.reset();
-  await hydrateDashboard();
-  await loadProjects();
-  await hydrateProjectWorkspace();
-  renderAll();
 });
 
-todoForm.addEventListener("submit", async (event) => {
+composerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!state.selectedProjectId) {
-    alert("请先选择项目。");
-    return;
+  await runTurn(composerQueryEl.value);
+});
+
+composerQueryEl.addEventListener("input", () => {
+  adjustComposerHeight();
+});
+
+composerQueryEl.addEventListener("keydown", async (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    await runTurn(composerQueryEl.value);
   }
-  const formData = new FormData(todoForm);
-  const payload = {
-    title: formData.get("title"),
-    description: formData.get("description") || "",
-    priority: formData.get("priority") || "medium",
-    status: formData.get("status") || "todo",
-  };
-  const todoId = formData.get("todo_id");
-  const url = todoId ? `/api/v1/todos/${todoId}` : `/api/v1/projects/${state.selectedProjectId}/todos`;
-  await request(url, {
-    method: todoId ? "PATCH" : "POST",
-    body: JSON.stringify(payload),
+});
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.assetDrawerOpen) {
+    toggleAssetDrawer(false);
+  }
+});
+
+initializeWorkspace()
+  .then(() => {
+    renderAll();
+    adjustComposerHeight();
+    composerQueryEl.focus();
+    scrollChatToBottom();
+  })
+  .catch((error) => {
+    alert(error.message);
   });
-  resetTodoForm();
-  await hydrateDashboard();
-  await loadProjects();
-  await hydrateProjectWorkspace();
-  renderAll();
-});
-
-todoResetButton.addEventListener("click", resetTodoForm);
-
-runForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const query = new FormData(runForm).get("user_query")?.toString().trim();
-  if (!query) {
-    alert("请输入研究问题。");
-    return;
-  }
-  await runResearch({ user_query: query });
-  runForm.reset();
-});
-
-async function bootstrap() {
-  await Promise.all([hydrateConfig(), hydrateDashboard(), loadProjects()]);
-  await hydrateProjectWorkspace();
-  renderAll();
-}
-
-runDetailCloseButton.addEventListener("click", closeRunModal);
-runDetailModalEl.querySelectorAll("[data-close-run-modal]").forEach((target) => {
-  target.addEventListener("click", closeRunModal);
-});
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !runDetailModalEl.hidden) {
-    closeRunModal();
-  }
-});
-
-bootstrap().catch((error) => {
-  runStatusEl.textContent = error.message;
-});

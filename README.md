@@ -16,14 +16,21 @@ The current MVP is built around a fixed `plan-and-solve` runtime:
 
 The backend serves both the API and the workspace UI, which keeps local deployment simple.
 
+## Workspace Preview
+
+![Research Copilot workspace with Agent execution trace](docs/images/main-page-agent-trace.png)
+
+The main workspace keeps conversation, project assets, and run history in one screen. The left sidebar provides quick access to new chats, assets, and recent sessions, while the center panel shows the current conversation. When Agent mode is enabled, the answer area includes a step-by-step execution trace so you can inspect tool choices such as local RAG search, public search, memory, TODO, asset listing, and calculation before the final response.
+
 ## Current Capabilities
 
 - Project CRUD with dashboard summaries
-- Text and Markdown asset creation, editing, and upload
+- Text, Markdown, and PDF asset creation, editing, and upload
 - TODO CRUD and direct TODO execution
 - Project-scoped hybrid retrieval with dense + BM25 fusion
 - Local reranking for evidence ordering
 - Cited answer generation
+- Live/public-information tool routing, with weather questions routed to an external weather tool
 - Layered memory with working, episodic, and semantic recall
 - Run history and detailed execution traces
 - Browser workspace served from the same FastAPI app
@@ -105,7 +112,7 @@ docker compose --profile llm up -d
 - `docker-compose.yml` mounts `./models` to `/models` inside the runtime container.
 - If the required BAAI model snapshots are not already present under `./models`, the runtime will download them from Hugging Face on first use.
 - Those model files are intentionally excluded from Git and can be large.
-- The default upload limit is `2 MB` per text file.
+- The default upload limit is `100 MB` per uploaded file.
 
 ## Configuration
 
@@ -126,7 +133,13 @@ Important variables:
 | `QDRANT_COLLECTION` | `knowledge_chunks` | Chunk collection name |
 | `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | Semantic memory collection name |
 | `EXECUTION_MODE` | `plan_and_solve` | Runtime execution mode |
-| `UPLOAD_MAX_BYTES` | `2097152` | Max uploaded text size in bytes |
+| `UPLOAD_MAX_BYTES` | `104857600` | Max uploaded file size in bytes |
+| `LIVE_TOOLS_ENABLED` | `true` | Enable live/public-information tool routing |
+| `LLM_TOOL_PLANNER_ENABLED` | `true` | Let the LLM choose live tools before falling back to rules |
+| `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | Timeout for one LLM tool-planning call |
+| `AGENT_MAX_STEPS` | `5` | Max Plan-Act-Observe steps for `/agent/run` |
+| `PUBLIC_WEB_SEARCH_ENABLED` | `true` | Allow explicit web/search questions to call public search tools |
+| `LIVE_TOOL_TIMEOUT_SECONDS` | `8.0` | Timeout for one external tool call |
 | `DATABASE_URL` | empty | Optional override for MySQL connection string |
 
 ## API Overview
@@ -197,10 +210,10 @@ curl http://127.0.0.1:8001/healthz
 
 ## Current Scope
 
-- The current MVP focuses on text-based project assets.
+- The current MVP focuses on text-based and PDF research assets.
 - The browser workspace is served by the backend and is designed for local use.
 - The Docker stack provisions Redis and MinIO for planned workflow growth, but the core research loop today is centered on FastAPI, MySQL, local retrieval, and Qdrant.
-- PDF ingestion, OCR, report export, and broader workflow integration are still roadmap items.
+- OCR, report export, and broader workflow integration are still roadmap items.
 
 ## Documentation
 

@@ -46,7 +46,7 @@ class Settings(BaseModel):
     reranker_model_dir: Path = Path(os.getenv("RERANKER_MODEL_DIR", "/models"))
     reranker_device: str = os.getenv("RERANKER_DEVICE", "cpu")
     reranker_batch_size: int = int(os.getenv("RERANKER_BATCH_SIZE", "2"))
-    reranker_max_length: int = int(os.getenv("RERANKER_MAX_LENGTH", "1024"))
+    reranker_max_length: int = int(os.getenv("RERANKER_MAX_LENGTH", "512"))
     execution_mode: str = os.getenv("EXECUTION_MODE", "plan_and_solve")
     retrieval_limit: int = int(os.getenv("RETRIEVAL_LIMIT", "5"))
     retrieval_candidate_limit: int = int(os.getenv("RETRIEVAL_CANDIDATE_LIMIT", "16"))
@@ -54,7 +54,23 @@ class Settings(BaseModel):
     working_memory_limit: int = int(os.getenv("WORKING_MEMORY_LIMIT", "8"))
     episodic_memory_limit: int = int(os.getenv("EPISODIC_MEMORY_LIMIT", "4"))
     semantic_memory_limit: int = int(os.getenv("SEMANTIC_MEMORY_LIMIT", "6"))
-    upload_max_bytes: int = int(os.getenv("UPLOAD_MAX_BYTES", str(2 * 1024 * 1024)))
+    upload_max_bytes: int = int(os.getenv("UPLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
+    live_tools_enabled: bool = os.getenv("LIVE_TOOLS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    llm_tool_planner_enabled: bool = os.getenv("LLM_TOOL_PLANNER_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    llm_tool_planner_timeout_seconds: float = float(os.getenv("LLM_TOOL_PLANNER_TIMEOUT_SECONDS", "20.0"))
+    agent_max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "5"))
+    public_web_search_enabled: bool = os.getenv("PUBLIC_WEB_SEARCH_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    live_tool_timeout_seconds: float = float(os.getenv("LIVE_TOOL_TIMEOUT_SECONDS", "8.0"))
     cors_origins: list[str] = _split_csv(os.getenv("CORS_ORIGINS", "*"))
     database_url: str = os.getenv("DATABASE_URL", "")
     vector_store_provider: str = os.getenv("VECTOR_STORE_PROVIDER", "qdrant")

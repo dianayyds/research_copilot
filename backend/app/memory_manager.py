@@ -63,6 +63,7 @@ def serialize_working(item: WorkingMemoryItem) -> MemoryRecordResponse:
         memory_value=item.content,
         source=item.source,
         session_id=item.session_id,
+        sequence_id=item.sequence_id,
         importance=item.importance,
         metadata=item.meta_payload,
         updated_at=item.updated_at,
@@ -78,6 +79,7 @@ def serialize_episodic(item: EpisodicMemoryItem) -> MemoryRecordResponse:
         memory_value=item.summary,
         source=item.source,
         session_id=item.session_id,
+        sequence_id=item.sequence_id,
         importance=item.importance,
         metadata=item.details,
         updated_at=item.updated_at,
@@ -93,6 +95,7 @@ def serialize_semantic(item: SemanticMemoryFact) -> MemoryRecordResponse:
         memory_value=item.statement,
         source=item.source,
         session_id=item.session_id,
+        sequence_id=item.sequence_id,
         importance=item.importance,
         metadata=item.meta_payload,
         updated_at=item.updated_at,
@@ -141,6 +144,7 @@ def semantic_fact_payload(item: SemanticMemoryFact) -> dict[str, Any]:
         "chunk_id": item.id,
         "project_id": item.project_id,
         "session_id": item.session_id or "",
+        "sequence_id": item.sequence_id,
         "fact_type": item.fact_type,
         "memory_key": item.memory_key,
         "title": f"{item.fact_type}:{item.memory_key}",
@@ -225,6 +229,7 @@ def store_working_memory(
     db: Session,
     project_id: str,
     session_id: str,
+    sequence_id: int,
     user_query: str,
     answer: str,
     citations: list[str],
@@ -234,19 +239,21 @@ def store_working_memory(
             id=make_id("wm"),
             project_id=project_id,
             session_id=session_id,
-            memory_key="latest_user_query",
+            sequence_id=sequence_id,
+            memory_key=f"turn_{sequence_id}_query",
             content=compact_text(user_query, 240),
             importance=0.7,
-            metadata={"kind": "query"},
+            meta_payload={"kind": "query", "sequence_id": sequence_id},
         ),
         WorkingMemoryItem(
             id=make_id("wm"),
             project_id=project_id,
             session_id=session_id,
-            memory_key="latest_answer_summary",
+            sequence_id=sequence_id,
+            memory_key=f"turn_{sequence_id}_answer",
             content=compact_text(answer, 240),
             importance=0.8,
-            metadata={"kind": "answer_summary", "citations": citations},
+            meta_payload={"kind": "answer_summary", "citations": citations, "sequence_id": sequence_id},
         ),
     ]
     for item in items:
@@ -260,6 +267,7 @@ def store_episodic_memory(
     db: Session,
     project_id: str,
     session_id: str,
+    sequence_id: int,
     user_query: str,
     answer: str,
     citations: list[str],
@@ -269,9 +277,11 @@ def store_episodic_memory(
         id=make_id("ep"),
         project_id=project_id,
         session_id=session_id,
+        sequence_id=sequence_id,
         event_type="research_run",
         summary=compact_text(f"{todo_title or user_query} -> {answer}", 220),
         details={
+            "sequence_id": sequence_id,
             "query": user_query,
             "todo_title": todo_title or "",
             "answer_summary": compact_text(answer, 240),
@@ -362,6 +372,7 @@ def upsert_semantic_fact(
     db: Session,
     project_id: str,
     session_id: str,
+    sequence_id: int,
     draft: dict[str, Any],
 ) -> SemanticMemoryFact:
     fact = db.scalar(
@@ -375,6 +386,7 @@ def upsert_semantic_fact(
         id=make_id("sm"),
         project_id=project_id,
         session_id=session_id,
+        sequence_id=sequence_id,
         fact_type=draft["fact_type"],
         memory_key=draft["memory_key"],
         statement=draft["statement"],
@@ -386,6 +398,7 @@ def upsert_semantic_fact(
         meta_payload=draft["metadata"],
     )
     target.session_id = session_id
+    target.sequence_id = sequence_id
     target.statement = draft["statement"]
     target.subject = draft["subject"]
     target.predicate = draft["predicate"]
@@ -401,13 +414,14 @@ def store_semantic_memories(
     db: Session,
     project_id: str,
     session_id: str,
+    sequence_id: int,
     user_query: str,
     answer: str,
     citations: list[str],
     todo_title: str | None = None,
 ) -> list[SemanticMemoryFact]:
     stored = [
-        upsert_semantic_fact(db, project_id, session_id, draft)
+        upsert_semantic_fact(db, project_id, session_id, sequence_id, draft)
         for draft in semantic_fact_drafts(user_query, answer, citations, todo_title=todo_title)
     ]
     get_semantic_memory_store().upsert_facts(project_id, [semantic_fact_payload(item) for item in stored])
@@ -418,14 +432,33 @@ def consolidate_layered_memories(
     db: Session,
     project_id: str,
     session_id: str,
+    sequence_id: int,
     user_query: str,
     answer: str,
     citations: list[str],
     todo_title: str | None = None,
 ) -> list[MemoryItem]:
-    working = store_working_memory(db, project_id, session_id, user_query, answer, citations)
-    episodic = store_episodic_memory(db, project_id, session_id, user_query, answer, citations, todo_title=todo_title)
-    semantic = store_semantic_memories(db, project_id, session_id, user_query, answer, citations, todo_title=todo_title)
+    working = store_working_memory(db, project_id, session_id, sequence_id, user_query, answer, citations)
+    episodic = store_episodic_memory(
+        db,
+        project_id,
+        session_id,
+        sequence_id,
+        user_query,
+        answer,
+        citations,
+        todo_title=todo_title,
+    )
+    semantic = store_semantic_memories(
+        db,
+        project_id,
+        session_id,
+        sequence_id,
+        user_query,
+        answer,
+        citations,
+        todo_title=todo_title,
+    )
     updates = [
         MemoryItem(
             memory_type="working",
@@ -433,6 +466,7 @@ def consolidate_layered_memories(
             value=item.content,
             source=item.source,
             session_id=item.session_id,
+            sequence_id=item.sequence_id,
             importance=item.importance,
             metadata=item.meta_payload,
         )
@@ -445,6 +479,7 @@ def consolidate_layered_memories(
             value=episodic.summary,
             source=episodic.source,
             session_id=episodic.session_id,
+            sequence_id=episodic.sequence_id,
             importance=episodic.importance,
             metadata=episodic.details,
         )
@@ -456,6 +491,7 @@ def consolidate_layered_memories(
             value=item.statement,
             source=item.source,
             session_id=item.session_id,
+            sequence_id=item.sequence_id,
             importance=item.importance,
             metadata=item.meta_payload,
         )

@@ -3,7 +3,11 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any
 
-from qdrant_client import QdrantClient, models
+try:
+    from qdrant_client import QdrantClient, models
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in stub tests
+    QdrantClient = None
+    models = None
 
 from app.config import settings
 from app.vector_store import (
@@ -48,6 +52,8 @@ class StubSemanticMemoryStore:
 
 class QdrantSemanticMemoryStore:
     def __init__(self) -> None:
+        if QdrantClient is None or models is None:
+            raise RuntimeError("qdrant_client is required when VECTOR_STORE_PROVIDER=qdrant")
         self.client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         self._embedder: BgeM3Embedder | None = None
         self._reranker: BgeReranker | None = None

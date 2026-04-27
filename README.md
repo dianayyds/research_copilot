@@ -31,6 +31,7 @@ The main workspace keeps conversation, project assets, and run history in one sc
 - Local reranking for evidence ordering
 - Cited answer generation
 - Live/public-information tool routing, with weather questions routed to an external weather tool
+- Optional LATS Agent/MCTS mode for searching tool-decision paths across RAG, web, weather, memory, assets, TODOs, calculator, and final answers
 - Layered memory with working, episodic, and semantic recall
 - Run history and detailed execution traces
 - Browser workspace served from the same FastAPI app
@@ -138,6 +139,9 @@ Important variables:
 | `LLM_TOOL_PLANNER_ENABLED` | `true` | Let the LLM choose live tools before falling back to rules |
 | `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | Timeout for one LLM tool-planning call |
 | `AGENT_MAX_STEPS` | `5` | Max Plan-Act-Observe steps for `/agent/run` |
+| `LATS_BRANCHING_FACTOR` | `4` | Max candidate agent actions expanded per LATS node |
+| `LATS_MAX_DEPTH` | `2` | Max Agent decision-tree depth for LATS |
+| `LATS_ITERATIONS` | `6` | MCTS iteration budget for `/lats/run` |
 | `PUBLIC_WEB_SEARCH_ENABLED` | `true` | Allow explicit web/search questions to call public search tools |
 | `LIVE_TOOL_TIMEOUT_SECONDS` | `8.0` | Timeout for one external tool call |
 | `DATABASE_URL` | empty | Optional override for MySQL connection string |

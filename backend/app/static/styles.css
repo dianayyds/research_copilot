@@ -549,6 +549,7 @@ button {
 .composer-left {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 14px;
   min-width: 0;
 }

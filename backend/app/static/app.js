@@ -11,6 +11,7 @@ const state = {
   assets: [],
   assetDrawerOpen: false,
   agentMode: false,
+  latsMode: false,
 };
 
 const sessionListEl = document.getElementById("session-list");
@@ -21,6 +22,7 @@ const composerForm = document.getElementById("composer-form");
 const composerQueryEl = document.getElementById("composer-query");
 const composerSubmitEl = document.getElementById("composer-submit");
 const agentModeToggleEl = document.getElementById("agent-mode-toggle");
+const latsModeToggleEl = document.getElementById("lats-mode-toggle");
 const newSessionButton = document.getElementById("new-session-button");
 const assetToggleButton = document.getElementById("asset-toggle-button");
 const assetCloseButton = document.getElementById("asset-close-button");
@@ -82,6 +84,27 @@ function nextSequenceId() {
   return (selectedSession()?.last_sequence_id || 0) + 1;
 }
 
+function runModeLabel() {
+  if (state.latsMode) {
+    return "LATS";
+  }
+  return state.agentMode ? "Agent" : "Research";
+}
+
+function plannerModeForStreamingRun() {
+  if (state.latsMode) {
+    return "lats_agent_mcts";
+  }
+  return state.agentMode ? "agent_loop" : "two_stage";
+}
+
+function runPathForMode() {
+  if (state.latsMode) {
+    return "lats/run/stream";
+  }
+  return state.agentMode ? "agent/run/stream" : "run/stream";
+}
+
 function resetAssetForm() {
   assetForm.reset();
   assetForm.asset_id.value = "";
@@ -104,6 +127,7 @@ function setSubmitting(isSubmitting) {
   composerQueryEl.disabled = isSubmitting;
   composerSubmitEl.disabled = isSubmitting;
   agentModeToggleEl.disabled = isSubmitting;
+  latsModeToggleEl.disabled = isSubmitting;
   composerSubmitEl.innerHTML = `<span>${isSubmitting ? "…" : "↑"}</span>`;
 }
 
@@ -122,8 +146,9 @@ function toggleAssetDrawer(forceOpen) {
 function renderHeader() {
   const session = selectedSession();
   chatTitleEl.textContent = session ? session.title : "新对话";
-  sequenceHintEl.textContent = `${state.agentMode ? "Agent" : "Research"} · 下一轮 #${nextSequenceId()}`;
+  sequenceHintEl.textContent = `${runModeLabel()} · 下一轮 #${nextSequenceId()}`;
   agentModeToggleEl.checked = state.agentMode;
+  latsModeToggleEl.checked = state.latsMode;
 }
 
 function renderSessions() {
@@ -406,7 +431,7 @@ function createStreamingRun(query, sessionId, sequenceId) {
     status: "streaming",
     answer: { answer: "", citations: [] },
     plan: {
-      planner_mode: state.agentMode ? "agent_loop" : "two_stage",
+      planner_mode: plannerModeForStreamingRun(),
       plan_summary: "",
       tasks: [],
       execution_trace: [],
@@ -472,7 +497,7 @@ async function runTurn(query) {
     state.streamingRun = createStreamingRun(prompt, state.selectedSessionId, sequenceId);
     renderAll();
     scrollChatToBottom();
-    const runPath = state.agentMode ? "agent/run/stream" : "run/stream";
+    const runPath = runPathForMode();
     await streamRequest(`/api/v1/projects/${state.workspaceProjectId}/sessions/${state.selectedSessionId}/${runPath}`, {
       user_query: prompt,
       asset_ids: [],
@@ -525,6 +550,17 @@ assetToggleButton.addEventListener("click", () => {
 
 agentModeToggleEl.addEventListener("change", () => {
   state.agentMode = agentModeToggleEl.checked;
+  if (state.agentMode) {
+    state.latsMode = false;
+  }
+  renderHeader();
+});
+
+latsModeToggleEl.addEventListener("change", () => {
+  state.latsMode = latsModeToggleEl.checked;
+  if (state.latsMode) {
+    state.agentMode = false;
+  }
   renderHeader();
 });
 

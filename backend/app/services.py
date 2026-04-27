@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import ast
 import logging
+import math
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from time import perf_counter
@@ -97,6 +98,24 @@ class AgentToolObservation:
     content: str
     evidence_items: list[EvidenceItem]
     metadata: dict[str, object]
+
+
+@dataclass
+class LatsAgentNode:
+    node_id: str
+    parent: LatsAgentNode | None
+    depth: int
+    history: list[dict[str, object]]
+    decision: AgentDecision | None = None
+    observation: AgentToolObservation | None = None
+    evidence_items: list[EvidenceItem] = field(default_factory=list)
+    children: list[LatsAgentNode] = field(default_factory=list)
+    visits: int = 0
+    value_sum: float = 0.0
+    prior: float = 0.0
+    score: float = 0.0
+    terminal: bool = False
+    reflection: str = ""
 
 
 def make_id(prefix: str) -> str:
@@ -1950,6 +1969,759 @@ def execute_agent_plan(
     return plan, retrieval, answer
 
 
+def lats_plan(request: TurnScopedRequest) -> PlanTasksResponse:
+    tasks = [
+        ResearchTask(
+            task_id="task-1",
+            title="Select node",
+            goal="用 UCB 在当前 Agent 决策树中选择最值得继续探索的节点。",
+            task_type="lats_select",
+            output_key="selected_node",
+        ),
+        ResearchTask(
+            task_id="task-2",
+            title="Expand actions",
+            goal="为选中节点生成候选工具动作或最终回答分支。",
+            task_type="lats_expand",
+            depends_on=["task-1"],
+            output_key="candidate_actions",
+        ),
+        ResearchTask(
+            task_id="task-3",
+            title="Act and evaluate",
+            goal="执行只读工具动作，基于 observation 评分并回传到树。",
+            task_type="lats_evaluate",
+            depends_on=["task-2"],
+            output_key="node_values",
+        ),
+        ResearchTask(
+            task_id="task-4",
+            title="Final answer",
+            goal="从最高价值路径综合工具观察并生成最终回答。",
+            task_type="synthesize",
+            depends_on=["task-3"],
+            output_key="final_answer",
+        ),
+    ]
+    return PlanTasksResponse(
+        project_id=request.project_id,
+        session_id=request.session_id,
+        sequence_id=request.sequence_id,
+        planner_mode="lats_agent_mcts",
+        plan_summary=(
+            f"LATS 使用 MCTS 在 Agent 工具决策树中搜索，预算为 {settings.lats_iterations} 次迭代、"
+            f"每次最多展开 {settings.lats_branching_factor} 个动作、深度上限 {settings.lats_max_depth}。"
+            "RAG 只是可选工具之一，不再作为 LATS 本身的搜索目标。"
+        ),
+        search_queries=[request.user_query],
+        tasks=tasks,
+    )
+
+
+def evidence_signature(item: EvidenceItem) -> tuple[str, str]:
+    return item.asset_id, item.chunk_id
+
+
+def dedupe_relabel_evidence(items: list[EvidenceItem]) -> list[EvidenceItem]:
+    deduped: list[EvidenceItem] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        signature = evidence_signature(item)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(item.model_copy(update={"label": f"C{len(deduped) + 1}"}))
+    return deduped[: settings.retrieval_limit]
+
+
+def lats_safe_actions() -> set[str]:
+    return {
+        "local_rag_search",
+        "weather_lookup",
+        "public_web_search",
+        "memory_read",
+        "todo_list",
+        "asset_list",
+        "calculator",
+        "final_answer",
+    }
+
+
+def lats_tool_catalog_payload() -> list[dict[str, object]]:
+    safe_actions = lats_safe_actions()
+    payload = [
+        {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
+        for tool in agent_tool_catalog()
+        if tool.name in safe_actions
+    ]
+    payload.append(
+        {
+            "name": "final_answer",
+            "description": "当已有 observation 足以回答，或确定不需要工具时结束搜索。",
+            "input_schema": {"answer": "最终回答，字符串"},
+        }
+    )
+    return payload
+
+
+def lats_history_actions(history: list[dict[str, object]]) -> list[str]:
+    return [str(item.get("action") or "") for item in history if item.get("kind") == "action"]
+
+
+def lats_observation_has_error(observation: AgentToolObservation | None) -> bool:
+    if observation is None:
+        return False
+    return bool(observation.metadata.get("error")) or "失败" in observation.summary
+
+
+def lats_observation_has_content(observation: AgentToolObservation | None) -> bool:
+    if observation is None or lats_observation_has_error(observation):
+        return False
+    empty_markers = ("没有命中", "当前没有", "暂无", "没有返回")
+    return bool(observation.evidence_items) or not any(marker in observation.content for marker in empty_markers)
+
+
+def lats_decision_key(decision: AgentDecision) -> str:
+    return json.dumps(
+        {"action": decision.action, "arguments": decision.arguments},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def lats_candidate(
+    thought: str,
+    action: str,
+    arguments: dict[str, object] | None = None,
+    prior: float = 0.5,
+) -> tuple[AgentDecision, float]:
+    return AgentDecision(thought=thought, action=action, arguments=arguments or {}), clamp_confidence(prior)
+
+
+def dedupe_lats_candidates(
+    candidates: list[tuple[AgentDecision, float]],
+    *,
+    limit: int,
+) -> list[tuple[AgentDecision, float]]:
+    deduped: list[tuple[AgentDecision, float]] = []
+    seen: set[str] = set()
+    for decision, prior in candidates:
+        decision = AgentDecision(
+            thought=decision.thought,
+            action=normalize_agent_action(decision.action),
+            arguments=decision.arguments,
+        )
+        if decision.action not in lats_safe_actions():
+            continue
+        key = lats_decision_key(decision)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((decision, prior))
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def fallback_lats_candidate_actions(
+    request: TurnScopedRequest,
+    history: list[dict[str, object]],
+    *,
+    limit: int,
+) -> list[tuple[AgentDecision, float]]:
+    query = request.user_query
+    called_tools = set(lats_history_actions(history))
+    observations = [item for item in history if item.get("kind") == "observation"]
+    last_observation = observations[-1] if observations else {}
+    last_tool = str(last_observation.get("tool") or "")
+    last_content = str(last_observation.get("content") or "")
+    candidates: list[tuple[AgentDecision, float]] = []
+
+    if observations:
+        has_success = any(not (isinstance(item.get("metadata"), dict) and item["metadata"].get("error")) for item in observations)
+        has_useful_content = has_success and not any(marker in last_content for marker in ("没有命中", "没有返回", "当前没有"))
+        if has_useful_content:
+            candidates.append(
+                lats_candidate(
+                    "已有可用 observation，尝试结束并综合回答。",
+                    "final_answer",
+                    {"answer": summarize_agent_observations(history)},
+                    0.94,
+                )
+            )
+        if last_tool == "local_rag_search" and "public_web_search" not in called_tools and settings.public_web_search_enabled:
+            candidates.append(
+                lats_candidate(
+                    "本地检索可能不足，尝试公开搜索补充。",
+                    "public_web_search",
+                    {"query": query},
+                    0.62,
+                )
+            )
+        if last_tool == "public_web_search" and "local_rag_search" not in called_tools:
+            candidates.append(
+                lats_candidate(
+                    "公开搜索不足，回到项目知识库查找。",
+                    "local_rag_search",
+                    {"query": query},
+                    0.7,
+                )
+            )
+        if "memory_read" not in called_tools and any(term in query for term in ("刚才", "之前", "记忆", "项目")):
+            candidates.append(lats_candidate("补充读取项目记忆。", "memory_read", {"query": query}, 0.58))
+        if not candidates:
+            candidates.append(
+                lats_candidate(
+                    "没有更好的只读工具分支，结束并说明当前观察。",
+                    "final_answer",
+                    {"answer": summarize_agent_observations(history)},
+                    0.5,
+                )
+            )
+        return dedupe_lats_candidates(candidates, limit=limit)
+
+    if "计算" in query or re.search(r"\d+\s*[-+*/%]", query):
+        candidates.append(lats_candidate("算术问题优先调用计算器。", "calculator", {"expression": extract_expression(query)}, 0.96))
+    if any(term in query for term in ("天气", "气温", "温度", "出游", "下雨", "降水")):
+        candidates.append(lats_candidate("需要实时天气事实。", "weather_lookup", {"query": query}, 0.9))
+    if wants_todo_list(query):
+        candidates.append(lats_candidate("用户询问 TODO 列表。", "todo_list", {}, 0.82))
+    if any(term in query for term in ("资产", "文档", "资料")):
+        candidates.append(lats_candidate("用户询问资产资料。", "asset_list", {}, 0.78))
+    if any(term in query for term in ("记忆", "刚才", "记住", "之前")):
+        candidates.append(lats_candidate("用户询问记忆内容。", "memory_read", {"query": query}, 0.8))
+    if settings.public_web_search_enabled and any(
+        term in query for term in ("联网", "搜索", "最新", "新闻", "官网", "公开资料", "今天", "今年", "现在", "当前", "年龄", "多大", "几岁")
+    ):
+        candidates.append(lats_candidate("问题可能需要公开或时效信息。", "public_web_search", {"query": query}, 0.74))
+    candidates.append(lats_candidate("从项目知识库检索本地证据。", "local_rag_search", {"query": query}, 0.68))
+    return dedupe_lats_candidates(candidates, limit=limit)
+
+
+def llm_lats_candidate_actions(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    history: list[dict[str, object]],
+    *,
+    limit: int,
+) -> list[tuple[AgentDecision, float]]:
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 LATS 的 expansion policy。只返回 JSON，不要 Markdown。"
+                        "为当前 Agent 状态提出多个可比较的下一步动作。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "可用只读/无副作用工具：\n"
+                        f"{json.dumps(lats_tool_catalog_payload(), ensure_ascii=False)}\n\n"
+                        "输出 JSON schema：\n"
+                        "{"
+                        '"actions": ['
+                        '{"thought": "简短理由", "action": "工具名或 final_answer", '
+                        '"arguments": {"参数": "值"}, "prior": 0.0}'
+                        "]"
+                        "}\n\n"
+                        "约束：\n"
+                        "- 不要选择 memory_write 或 todo_create，这些有副作用。\n"
+                        "- 每个动作必须互相有差异，便于树搜索比较。\n"
+                        "- 有 observation 且足够回答时，包含 final_answer 分支。\n"
+                        "- 工具失败或证据不足时，提出替代工具分支。\n\n"
+                        f"用户问题：{request.user_query}\n\n"
+                        f"项目上下文预览：\n{context.packed_context[:2200]}\n\n"
+                        f"当前路径历史：\n{agent_history_text(history)}\n\n"
+                        f"最多返回 {limit} 个动作。"
+                    ),
+                },
+            ],
+            "temperature": 0.4,
+            "max_tokens": 900,
+        },
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
+    raw_actions = payload.get("actions") or []
+    if not isinstance(raw_actions, list):
+        raise ValueError("LATS expansion policy did not return an actions list")
+    candidates: list[tuple[AgentDecision, float]] = []
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        decision = agent_decision_from_payload(item)
+        candidates.append((decision, clamp_confidence(item.get("prior", 0.5))))
+    return dedupe_lats_candidates(candidates, limit=limit)
+
+
+def lats_candidate_actions(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    history: list[dict[str, object]],
+    *,
+    limit: int,
+) -> list[tuple[AgentDecision, float]]:
+    candidates: list[tuple[AgentDecision, float]] = []
+    if llm_available():
+        try:
+            candidates.extend(llm_lats_candidate_actions(request, context, history, limit=limit))
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("llm_lats_candidate_actions_failed error=%s", exc)
+    candidates.extend(fallback_lats_candidate_actions(request, history, limit=limit))
+    return dedupe_lats_candidates(candidates, limit=limit)
+
+
+def lats_decision_summary(decision: AgentDecision) -> str:
+    return (
+        f"thought={decision.thought or '未提供'}; action={decision.action}; "
+        f"args={json.dumps(decision.arguments, ensure_ascii=False, default=str)}"
+    )
+
+
+def lats_ucb_score(parent: LatsAgentNode, child: LatsAgentNode) -> float:
+    if child.visits <= 0:
+        return float("inf")
+    exploitation = child.value_sum / child.visits
+    exploration = math.sqrt(math.log(max(parent.visits, 1) + 1) / child.visits)
+    return exploitation + 1.414 * exploration + 0.1 * child.prior
+
+
+def lats_select_leaf(root: LatsAgentNode) -> LatsAgentNode:
+    node = root
+    while node.children and not node.terminal and node.depth < max(settings.lats_max_depth, 1):
+        node = max(node.children, key=lambda child: lats_ucb_score(node, child))
+    return node
+
+
+def lats_backpropagate(node: LatsAgentNode, value: float) -> None:
+    current: LatsAgentNode | None = node
+    while current is not None:
+        current.visits += 1
+        current.value_sum += value
+        current = current.parent
+
+
+def lats_path(node: LatsAgentNode) -> list[LatsAgentNode]:
+    path: list[LatsAgentNode] = []
+    current: LatsAgentNode | None = node
+    while current is not None:
+        path.append(current)
+        current = current.parent
+    return list(reversed(path))
+
+
+def lats_node_average(node: LatsAgentNode) -> float:
+    return node.value_sum / node.visits if node.visits else node.score
+
+
+def lats_all_nodes(root: LatsAgentNode) -> list[LatsAgentNode]:
+    nodes = [root]
+    for child in root.children:
+        nodes.extend(lats_all_nodes(child))
+    return nodes
+
+
+def execute_lats_decision(
+    db: Session,
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    *,
+    parent: LatsAgentNode,
+    decision: AgentDecision,
+    prior: float,
+    child_index: int,
+) -> LatsAgentNode:
+    history = list(parent.history)
+    step_number = len([item for item in history if item.get("kind") == "action"]) + 1
+    history.append(
+        {
+            "kind": "action",
+            "step": step_number,
+            "thought": decision.thought,
+            "action": decision.action,
+            "arguments": decision.arguments,
+        }
+    )
+    node = LatsAgentNode(
+        node_id=f"{parent.node_id}.{child_index}" if parent.parent is not None else f"n{child_index}",
+        parent=parent,
+        depth=parent.depth + 1,
+        history=history,
+        decision=decision,
+        evidence_items=list(parent.evidence_items),
+        prior=prior,
+    )
+    if decision.action == "final_answer":
+        answer_text = str(decision.arguments.get("answer") or summarize_agent_observations(parent.history))
+        node.history.append({"kind": "final", "step": step_number, "content": answer_text})
+        node.terminal = True
+        return node
+    try:
+        observation = execute_agent_tool(db, request, context, decision)
+        evidence_items = dedupe_relabel_evidence([*parent.evidence_items, *observation.evidence_items])
+    except (httpx.HTTPError, ValueError, ZeroDivisionError) as exc:
+        observation = AgentToolObservation(
+            tool_name=decision.action,
+            summary=f"工具调用失败：{exc}",
+            content=f"工具 {decision.action} 调用失败：{exc}",
+            evidence_items=[],
+            metadata={"error": str(exc)},
+        )
+        evidence_items = list(parent.evidence_items)
+    node.observation = observation
+    node.evidence_items = evidence_items
+    node.history.append(
+        {
+            "kind": "observation",
+            "step": step_number,
+            "tool": observation.tool_name,
+            "summary": observation.summary,
+            "content": observation.content[:1200],
+            "metadata": observation.metadata,
+            "evidence_labels": [item.label for item in evidence_items],
+        }
+    )
+    return node
+
+
+def lats_query_overlap_score(query: str, text: str) -> float:
+    terms = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_./+-]+|[\u4e00-\u9fff]{2,}", query)
+        if token.strip()
+    ]
+    if not terms:
+        return 0.0
+    lowered = text.lower()
+    overlap = sum(1 for term in terms if term in lowered)
+    return min(overlap / max(len(terms), 1), 1.0)
+
+
+def heuristic_lats_evaluation(request: TurnScopedRequest, node: LatsAgentNode) -> tuple[float, bool, str]:
+    if node.decision is None:
+        return 0.0, False, "root 节点尚未执行动作。"
+    if node.decision.action == "final_answer":
+        answer = str(node.decision.arguments.get("answer") or "")
+        if contains_restrictive_fallback_text(answer):
+            return 0.15, True, "final_answer 含限制性失败话术，价值较低。"
+        inherited = lats_node_average(node.parent) if node.parent else 0.25
+        score = max(0.25, min(1.0, inherited + (0.08 if answer.strip() else 0.0)))
+        return score, True, "final_answer 结束路径，继承并小幅奖励已有 observation 价值。"
+    observation = node.observation
+    if observation is None:
+        return 0.05, False, "动作没有产生 observation。"
+    if lats_observation_has_error(observation):
+        return 0.04, False, "工具调用失败，该分支降权。"
+    content = f"{observation.summary}\n{observation.content}"
+    overlap_bonus = 0.12 * lats_query_overlap_score(request.user_query, content)
+    action = node.decision.action
+    if action == "calculator":
+        return 0.96, True, "calculator 成功返回确定性计算结果。"
+    if action == "local_rag_search":
+        if not observation.evidence_items:
+            return 0.12, False, "本地 RAG 没有命中证据，可尝试其他工具。"
+        top_score = max(item.score for item in observation.evidence_items)
+        score = min(0.92, 0.35 + 0.08 * min(len(observation.evidence_items), 5) + 0.08 * min(top_score, 2.0) + overlap_bonus)
+        return score, False, "本地 RAG 命中证据，按证据数、最高分和问题重叠评分。"
+    if action in {"weather_lookup", "public_web_search"}:
+        if not lats_observation_has_content(observation):
+            return 0.18, False, f"{action} 没有返回可用内容。"
+        score = min(0.88, 0.58 + 0.08 * min(len(observation.evidence_items), 3) + overlap_bonus)
+        return score, False, f"{action} 返回可用外部 observation。"
+    if action in {"memory_read", "todo_list", "asset_list"}:
+        if not lats_observation_has_content(observation):
+            return 0.22, False, f"{action} 返回为空。"
+        return min(0.72, 0.52 + overlap_bonus), False, f"{action} 返回可用项目状态。"
+    return 0.3 + overlap_bonus, False, "未知只读动作按弱可用分支处理。"
+
+
+def llm_lats_evaluate_node(request: TurnScopedRequest, node: LatsAgentNode) -> tuple[float, bool, str]:
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 LATS 的 value/reflection evaluator。只返回 JSON，不要 Markdown。"
+                        "根据当前路径对是否接近回答用户问题打分。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "输出 JSON schema："
+                        '{"score": 0.0, "terminal": false, "reflection": "简短反思"}\n\n'
+                        "评分要求：0 表示无用或失败，1 表示可以可靠回答。"
+                        "不要因为工具名本身打高分，要看 observation 是否回答了用户问题。\n\n"
+                        f"用户问题：{request.user_query}\n\n"
+                        f"当前路径：\n{agent_history_text(node.history)}"
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 500,
+        },
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
+    score = clamp_confidence(payload.get("score", 0.0))
+    terminal = planner_truthy(payload.get("terminal", False))
+    reflection = compact_text(str(payload.get("reflection") or ""), 300)
+    return score, terminal, reflection
+
+
+def lats_evaluate_node(request: TurnScopedRequest, node: LatsAgentNode) -> tuple[float, bool, str]:
+    if llm_available():
+        try:
+            return llm_lats_evaluate_node(request, node)
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("llm_lats_evaluate_node_failed error=%s", exc)
+    return heuristic_lats_evaluation(request, node)
+
+
+def best_lats_node(root: LatsAgentNode) -> LatsAgentNode:
+    candidates = [node for node in lats_all_nodes(root) if node.parent is not None]
+    if not candidates:
+        return root
+    return max(candidates, key=lambda node: (lats_node_average(node), node.score, node.visits, node.prior))
+
+
+def lats_search_queries_from_history(history: list[dict[str, object]]) -> list[str]:
+    queries: list[str] = []
+    for item in history:
+        if item.get("kind") != "action":
+            continue
+        arguments = item.get("arguments")
+        if isinstance(arguments, dict):
+            query = str(arguments.get("query") or "").strip()
+            if query:
+                queries.append(query)
+    return dedupe_preserve_order(queries)
+
+
+def execute_lats_agent_plan(
+    db: Session,
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    *,
+    on_step: Callable[[PlanExecutionStep], None] | None = None,
+) -> tuple[PlanTasksResponse, RetrieveResponse, AnswerResponse]:
+    plan = lats_plan(request)
+    trace: list[PlanExecutionStep] = []
+    root = LatsAgentNode(node_id="root", parent=None, depth=0, history=[])
+
+    def append_step(step: PlanExecutionStep) -> None:
+        trace.append(step)
+        if on_step is not None:
+            on_step(step)
+
+    branch_factor = max(1, settings.lats_branching_factor)
+    max_depth = max(1, settings.lats_max_depth)
+    iterations = max(1, settings.lats_iterations)
+    expanded_count = 0
+
+    for iteration in range(1, iterations + 1):
+        leaf = lats_select_leaf(root)
+        append_step(
+            PlanExecutionStep(
+                step_id=f"lats-iter-{iteration}-select",
+                task_id="task-1",
+                title="LATS select node",
+                action="lats_select",
+                summary=(
+                    f"iteration={iteration}; selected={leaf.node_id}; depth={leaf.depth}; "
+                    f"visits={leaf.visits}; avg={lats_node_average(leaf):.4f}。"
+                ),
+                evidence_labels=[item.label for item in leaf.evidence_items],
+            )
+        )
+        if leaf.terminal or leaf.depth >= max_depth:
+            score, terminal, reflection = lats_evaluate_node(request, leaf)
+            leaf.score = score
+            leaf.terminal = leaf.terminal or terminal
+            leaf.reflection = reflection
+            lats_backpropagate(leaf, score)
+            append_step(
+                PlanExecutionStep(
+                    step_id=f"lats-iter-{iteration}-backprop",
+                    task_id="task-3",
+                    title="LATS backpropagate",
+                    action="lats_backprop",
+                    summary=f"leaf={leaf.node_id}; score={score:.4f}; reflection={reflection}",
+                    evidence_labels=[item.label for item in leaf.evidence_items],
+                )
+            )
+            continue
+
+        candidates = lats_candidate_actions(request, context, leaf.history, limit=branch_factor)
+        append_step(
+            PlanExecutionStep(
+                step_id=f"lats-iter-{iteration}-expand",
+                task_id="task-2",
+                title="LATS expand actions",
+                action="lats_expand",
+                summary=(
+                    f"从节点 {leaf.node_id} 展开 {len(candidates)} 个候选动作："
+                    f"{', '.join(decision.action for decision, _ in candidates)}"
+                ),
+                search_queries=lats_search_queries_from_history(leaf.history),
+                evidence_labels=[item.label for item in leaf.evidence_items],
+            )
+        )
+        existing_child_keys = {lats_decision_key(child.decision) for child in leaf.children if child.decision is not None}
+        for candidate_index, (decision, prior) in enumerate(candidates, start=1):
+            if lats_decision_key(decision) in existing_child_keys:
+                continue
+            child = execute_lats_decision(
+                db,
+                request,
+                context,
+                parent=leaf,
+                decision=decision,
+                prior=prior,
+                child_index=len(leaf.children) + 1,
+            )
+            leaf.children.append(child)
+            expanded_count += 1
+            append_step(
+                PlanExecutionStep(
+                    step_id=f"lats-{child.node_id}-action",
+                    task_id="task-2",
+                    title=f"LATS action: {decision.action}",
+                    action="lats_action",
+                    summary=f"parent={leaf.node_id}; prior={prior:.2f}; {lats_decision_summary(decision)}",
+                    search_queries=lats_search_queries_from_history(child.history),
+                    evidence_labels=[item.label for item in leaf.evidence_items],
+                )
+            )
+            if child.observation is not None:
+                append_step(
+                    PlanExecutionStep(
+                        step_id=f"lats-{child.node_id}-observation",
+                        task_id="task-3",
+                        title=f"LATS observation: {child.observation.tool_name}",
+                        action="lats_observation",
+                        summary=f"{child.observation.summary} {compact_text(child.observation.content, 240)}",
+                        status="failed" if lats_observation_has_error(child.observation) else "completed",
+                        evidence_labels=[item.label for item in child.evidence_items],
+                    )
+                )
+            score, terminal, reflection = lats_evaluate_node(request, child)
+            child.score = score
+            child.terminal = child.terminal or terminal
+            child.reflection = reflection
+            append_step(
+                PlanExecutionStep(
+                    step_id=f"lats-{child.node_id}-evaluate",
+                    task_id="task-3",
+                    title="LATS evaluate node",
+                    action="lats_evaluate",
+                    summary=f"node={child.node_id}; score={score:.4f}; terminal={child.terminal}; reflection={reflection}",
+                    evidence_labels=[item.label for item in child.evidence_items],
+                )
+            )
+            lats_backpropagate(child, score)
+            append_step(
+                PlanExecutionStep(
+                    step_id=f"lats-{child.node_id}-backprop",
+                    task_id="task-3",
+                    title="LATS backpropagate",
+                    action="lats_backprop",
+                    summary=(
+                        f"node={child.node_id}; propagated={score:.4f}; "
+                        f"node_visits={child.visits}; root_visits={root.visits}"
+                    ),
+                    evidence_labels=[item.label for item in child.evidence_items],
+                )
+            )
+
+    best_node = best_lats_node(root)
+    final_evidence = best_node.evidence_items
+    best_path = lats_path(best_node)
+    path_actions = [node.decision.action for node in best_path if node.decision is not None]
+    append_step(
+        PlanExecutionStep(
+            step_id="lats-final-select",
+            task_id="task-4",
+            title="LATS final path",
+            action="lats_final",
+            summary=(
+                f"选择路径 {' -> '.join(path_actions) or 'none'}；"
+                f"best_node={best_node.node_id}; avg={lats_node_average(best_node):.4f}; "
+                f"visits={best_node.visits}; expanded={expanded_count}。"
+            ),
+            evidence_labels=[item.label for item in final_evidence],
+        )
+    )
+
+    final_text = ""
+    if best_node.decision and best_node.decision.action == "final_answer":
+        final_text = str(best_node.decision.arguments.get("answer") or "")
+    answer_text = agent_final_answer_from_history(request, best_node.history, final_text, final_evidence)
+    direct_fallback_used = False
+    if agent_should_use_direct_llm_fallback(answer_text, best_node.history, final_evidence):
+        fallback = try_direct_llm_answer(
+            request,
+            reason="LATS agent tree search did not produce usable evidence or answer",
+            packed_context=context.packed_context,
+            observations=best_node.history,
+        )
+        if fallback:
+            answer_text = fallback
+            direct_fallback_used = True
+            append_step(
+                PlanExecutionStep(
+                    step_id="lats-direct-llm-fallback",
+                    task_id="task-4",
+                    title="LATS direct LLM fallback",
+                    action="lats_final",
+                    summary=compact_text(answer_text, 260),
+                    evidence_labels=[],
+                )
+            )
+    retrieval = RetrieveResponse(
+        project_id=request.project_id,
+        session_id=request.session_id,
+        sequence_id=request.sequence_id,
+        retrieval_mode="lats_agent_mcts",
+        evidence_items=final_evidence,
+    )
+    answer = AnswerResponse(
+        project_id=request.project_id,
+        session_id=request.session_id,
+        sequence_id=request.sequence_id,
+        answer=answer_text,
+        citations=[] if direct_fallback_used else citations_from_evidence(final_evidence),
+    )
+    plan = plan.model_copy(
+        update={
+            "tasks": mark_tasks_completed(plan.tasks),
+            "execution_trace": trace,
+            "solver_summary": (
+                f"LATS/MCTS 完成 {iterations} 次迭代，展开 {expanded_count} 个 Agent 动作节点；"
+                f"最佳路径 {' -> '.join(path_actions) or 'none'}，"
+                f"平均价值 {lats_node_average(best_node):.4f}，保留 {len(final_evidence)} 条证据。"
+            ),
+            "replan_count": expanded_count,
+            "replan_reason": "MCTS 通过 selection/expansion/evaluation/backpropagation 反复重估工具路径。",
+            "search_queries": dedupe_preserve_order([request.user_query, *lats_search_queries_from_history(best_node.history)]),
+        }
+    )
+    return plan, retrieval, answer
+
+
 def live_tool_catalog() -> list[dict[str, object]]:
     catalog: list[dict[str, object]] = [
         {
@@ -2559,6 +3331,62 @@ def run_agent_research(db: Session, request: TurnScopedRequest) -> RunResearchRe
     )
 
 
+def run_lats_research(db: Session, request: TurnScopedRequest) -> RunResearchResponse:
+    project = get_project(db, request.project_id)
+    session = get_chat_session(db, request.project_id, request.session_id)
+    todo = get_project_todo(db, project.id, request.todo_id) if request.todo_id else None
+    ensure_next_sequence(session, request.sequence_id)
+    assets = resolve_assets(db)
+    context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
+    plan, retrieval, answer = execute_lats_agent_plan(db, request, context)
+    memory = consolidate_memory(
+        db,
+        ConsolidateMemoryRequest(
+            project_id=request.project_id,
+            session_id=request.session_id,
+            sequence_id=request.sequence_id,
+            user_query=request.user_query,
+            asset_ids=request.asset_ids,
+            todo_id=request.todo_id,
+            answer=answer.answer,
+            citations=answer.citations,
+        ),
+        todo=todo,
+    )
+    trace_id = f"trace-{uuid.uuid4().hex[:12]}"
+    persist_research_run(
+        db,
+        project=project,
+        session=session,
+        request=request,
+        context=context,
+        plan=plan,
+        retrieval=retrieval,
+        answer=answer,
+        memory=memory,
+        todo=todo,
+        trace_id=trace_id,
+    )
+    return RunResearchResponse(
+        project_id=project.id,
+        session_id=session.id,
+        sequence_id=request.sequence_id,
+        context=context,
+        plan=plan,
+        retrieval=retrieval,
+        answer=answer,
+        memory=memory,
+        trace_id=trace_id,
+        meta={
+            "mode": "lats_agent_mcts",
+            "planner_mode": plan.planner_mode,
+            "lats_branching_factor": settings.lats_branching_factor,
+            "lats_max_depth": settings.lats_max_depth,
+            "lats_iterations": settings.lats_iterations,
+        },
+    )
+
+
 def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[dict[str, object]]:
     project = get_project(db, request.project_id)
     session = get_chat_session(db, request.project_id, request.session_id)
@@ -2750,6 +3578,62 @@ def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dic
     yield {"type": "complete", "run": run_to_detail(run).model_dump(mode="json")}
 
 
+def stream_lats_events(db: Session, request: TurnScopedRequest) -> Iterator[dict[str, object]]:
+    project = get_project(db, request.project_id)
+    session = get_chat_session(db, request.project_id, request.session_id)
+    todo = get_project_todo(db, project.id, request.todo_id) if request.todo_id else None
+    ensure_next_sequence(session, request.sequence_id)
+    assets = resolve_assets(db)
+    context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
+    initial_plan = lats_plan(request)
+    yield {"type": "plan", "plan": initial_plan.model_dump(mode="json")}
+    trace_events: list[PlanExecutionStep] = []
+    plan, retrieval, answer = execute_lats_agent_plan(
+        db,
+        request,
+        context,
+        on_step=trace_events.append,
+    )
+    for step in trace_events:
+        yield {"type": "trace", "step": step.model_dump(mode="json")}
+    yield {
+        "type": "solver_summary",
+        "solver_summary": plan.solver_summary,
+        "replan_count": plan.replan_count,
+        "replan_reason": plan.replan_reason,
+    }
+    yield {"type": "answer_delta", "delta": answer.answer, "answer": answer.answer}
+    memory = consolidate_memory(
+        db,
+        ConsolidateMemoryRequest(
+            project_id=request.project_id,
+            session_id=request.session_id,
+            sequence_id=request.sequence_id,
+            user_query=request.user_query,
+            asset_ids=request.asset_ids,
+            todo_id=request.todo_id,
+            answer=answer.answer,
+            citations=answer.citations,
+        ),
+        todo=todo,
+    )
+    trace_id = f"trace-{uuid.uuid4().hex[:12]}"
+    run = persist_research_run(
+        db,
+        project=project,
+        session=session,
+        request=request,
+        context=context,
+        plan=plan,
+        retrieval=retrieval,
+        answer=answer,
+        memory=memory,
+        todo=todo,
+        trace_id=trace_id,
+    )
+    yield {"type": "complete", "run": run_to_detail(run).model_dump(mode="json")}
+
+
 def create_and_run(
     db: Session,
     project_id: str,
@@ -2778,6 +3662,27 @@ def create_agent_and_run(
     payload: ResearchTurnRequest,
 ) -> ResearchRunDetailResponse:
     result = run_agent_research(
+        db,
+        TurnScopedRequest(
+            project_id=project_id,
+            session_id=session_id,
+            sequence_id=payload.sequence_id,
+            user_query=payload.user_query,
+            asset_ids=payload.asset_ids,
+            todo_id=payload.todo_id,
+        ),
+    )
+    run = db.scalar(select(ResearchRun).where(ResearchRun.trace_id == result.trace_id))
+    return get_run(db, run.id)
+
+
+def create_lats_and_run(
+    db: Session,
+    project_id: str,
+    session_id: str,
+    payload: ResearchTurnRequest,
+) -> ResearchRunDetailResponse:
+    result = run_lats_research(
         db,
         TurnScopedRequest(
             project_id=project_id,

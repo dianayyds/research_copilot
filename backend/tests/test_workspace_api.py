@@ -89,6 +89,7 @@ async def test_root_page_serves_workspace() -> None:
     assert "Research Copilot" in response.text
     assert "新对话" in response.text
     assert "资产" in response.text
+    assert "LATS" in response.text
 
 
 async def test_project_session_chat_flow_with_global_assets() -> None:
@@ -1017,6 +1018,128 @@ async def test_agent_stream_emits_agent_trace_events(monkeypatch: pytest.MonkeyP
     assert "agent_observation" in trace_actions
     assert "agent_final" in trace_actions
     assert events[-1]["run"]["plan"]["planner_mode"] == "agent_loop"
+
+
+async def test_lats_agent_mcts_selects_calculator_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_db()
+    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
+    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
+    monkeypatch.setattr("app.services.settings.lats_iterations", 4)
+    async with app.router.lifespan_context(app):
+        async with make_client() as client:
+            project = await create_project(client, "LATS Project")
+            session = await create_session(client, project["id"])
+            response = await client.post(
+                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run",
+                json={
+                    "user_query": "请计算 12 * (3 + 4)",
+                    "sequence_id": 1,
+                    "asset_ids": [],
+                },
+            )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["plan"]["planner_mode"] == "lats_agent_mcts"
+    assert payload["retrieval"]["retrieval_mode"] == "lats_agent_mcts"
+    assert "84" in payload["answer"]["answer"]
+    actions = [step["action"] for step in payload["plan"]["execution_trace"]]
+    assert "lats_select" in actions
+    assert "lats_expand" in actions
+    assert "lats_action" in actions
+    assert "lats_observation" in actions
+    assert "lats_evaluate" in actions
+    assert "lats_backprop" in actions
+    assert "lats_final" in actions
+    assert any("calculator" in step["summary"] for step in payload["plan"]["execution_trace"])
+
+
+async def test_lats_agent_mcts_recovers_from_failed_public_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_db()
+    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
+    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
+    monkeypatch.setattr("app.services.settings.lats_iterations", 4)
+    monkeypatch.setattr("app.services.settings.public_web_search_enabled", True)
+
+    def fail_public_search(route: LiveToolRoute, query: str) -> LiveToolResult:
+        if route.tool_name == "public_web_search":
+            raise ValueError("public search unavailable")
+        return LiveToolResult(answer="", evidence=[], metadata={})
+
+    monkeypatch.setattr("app.services.execute_live_tool", fail_public_search)
+    async with app.router.lifespan_context(app):
+        async with make_client() as client:
+            project = await create_project(client, "LATS Recovery Project")
+            session = await create_session(client, project["id"])
+            asset = (
+                await client.post(
+                    "/api/v1/assets",
+                    json={
+                        "title": "DeepSeek Function Calling",
+                        "asset_type": "note",
+                        "content": (
+                            "DeepSeek function calling lets a chat model choose structured tools, "
+                            "return JSON arguments, and then answer from the tool observations."
+                        ),
+                    },
+                )
+            ).json()
+            response = await client.post(
+                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run",
+                json={
+                    "user_query": "联网搜索一下 DeepSeek function calling 是什么",
+                    "sequence_id": 1,
+                    "asset_ids": [],
+                },
+            )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["plan"]["planner_mode"] == "lats_agent_mcts"
+    assert payload["retrieval"]["evidence_items"][0]["asset_id"] == asset["id"]
+    assert "function calling" in payload["answer"]["answer"].lower()
+    trace = payload["plan"]["execution_trace"]
+    assert any(step["action"] == "lats_observation" and step["status"] == "failed" for step in trace)
+    assert any(step["action"] == "lats_action" and "local_rag_search" in step["summary"] for step in trace)
+    assert any(step["action"] == "lats_final" for step in trace)
+
+
+async def test_lats_stream_emits_mcts_trace_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_db()
+    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
+    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
+    monkeypatch.setattr("app.services.settings.lats_iterations", 3)
+    async with app.router.lifespan_context(app):
+        async with make_client() as client:
+            project = await create_project(client, "LATS Stream Project")
+            session = await create_session(client, project["id"])
+            events: list[dict] = []
+            async with client.stream(
+                "POST",
+                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run/stream",
+                json={
+                    "user_query": "请计算 8 * 7",
+                    "sequence_id": 1,
+                    "asset_ids": [],
+                },
+            ) as response:
+                assert response.status_code == 200
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        events.append(json.loads(line))
+
+    event_types = [event["type"] for event in events]
+    assert "plan" in event_types
+    assert "trace" in event_types
+    assert "answer_delta" in event_types
+    assert event_types[-1] == "complete"
+    trace_actions = [event["step"]["action"] for event in events if event["type"] == "trace"]
+    assert "lats_expand" in trace_actions
+    assert "lats_select" in trace_actions
+    assert "lats_evaluate" in trace_actions
+    assert "lats_backprop" in trace_actions
+    assert events[-1]["run"]["plan"]["planner_mode"] == "lats_agent_mcts"
+    assert "56" in events[-1]["run"]["answer"]["answer"]
 
 
 async def test_stream_no_evidence_uses_direct_fallback_without_constrained_stream(

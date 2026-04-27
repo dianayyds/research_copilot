@@ -64,6 +64,9 @@ class Settings(BaseModel):
     }
     llm_tool_planner_timeout_seconds: float = float(os.getenv("LLM_TOOL_PLANNER_TIMEOUT_SECONDS", "20.0"))
     agent_max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "5"))
+    lats_branching_factor: int = int(os.getenv("LATS_BRANCHING_FACTOR", "4"))
+    lats_max_depth: int = int(os.getenv("LATS_MAX_DEPTH", "2"))
+    lats_iterations: int = int(os.getenv("LATS_ITERATIONS", "6"))
     public_web_search_enabled: bool = os.getenv("PUBLIC_WEB_SEARCH_ENABLED", "true").lower() in {
         "1",
         "true",

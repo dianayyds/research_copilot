@@ -31,6 +31,7 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 - 本地 reranker 对证据做最终排序
 - 带引用回答生成
 - 实时/公开信息工具路由，天气类问题优先调用外部天气工具
+- 可选 LATS Agent/MCTS 模式，用于在 RAG、联网、天气、记忆、资产、TODO、计算器和最终回答之间搜索工具决策路径
 - working、episodic、semantic 三层记忆
 - 运行历史和详细执行结果查看
 - 由同一个 FastAPI 服务直接提供浏览器工作区
@@ -138,6 +139,9 @@ docker compose --profile llm up -d
 | `LLM_TOOL_PLANNER_ENABLED` | `true` | 是否让 LLM 先决定实时工具，再回退规则 |
 | `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | 单次 LLM 工具规划调用超时时间 |
 | `AGENT_MAX_STEPS` | `5` | `/agent/run` 的 Plan-Act-Observe 最大步数 |
+| `LATS_BRANCHING_FACTOR` | `4` | LATS 每个节点最多展开的候选 Agent 动作数 |
+| `LATS_MAX_DEPTH` | `2` | LATS Agent 决策树最大深度 |
+| `LATS_ITERATIONS` | `6` | `/lats/run` 的 MCTS 迭代预算 |
 | `PUBLIC_WEB_SEARCH_ENABLED` | `true` | 是否允许显式联网/搜索类问题调用公开搜索工具 |
 | `LIVE_TOOL_TIMEOUT_SECONDS` | `8.0` | 单次外部工具调用超时时间 |
 | `DATABASE_URL` | 空 | 可选，用于覆盖默认 MySQL 连接串 |

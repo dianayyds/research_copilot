@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Research Copilot</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260424-stream" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260428-lats-mcts" />
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -56,6 +56,10 @@
                 <label class="agent-toggle">
                   <input id="agent-mode-toggle" type="checkbox" />
                   <span>Agent</span>
+                </label>
+                <label class="agent-toggle">
+                  <input id="lats-mode-toggle" type="checkbox" />
+                  <span>LATS</span>
                 </label>
               </div>
               <button class="send-button" id="composer-submit" type="submit" aria-label="发送">
@@ -135,6 +139,6 @@
       </aside>
     </div>
 
-    <script src="/static/app.js?v=20260424-upload-log"></script>
+    <script src="/static/app.js?v=20260428-lats-mcts"></script>
   </body>
 </html>

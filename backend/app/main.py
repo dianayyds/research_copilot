@@ -38,6 +38,7 @@ from app.services import (
     create_agent_and_run,
     create_and_run,
     create_asset,
+    create_lats_and_run,
     create_project,
     create_session,
     create_todo,
@@ -55,6 +56,7 @@ from app.services import (
     list_todos,
     project_to_response,
     stream_agent_events,
+    stream_lats_events,
     stream_research_events,
     update_asset,
     update_project,
@@ -334,6 +336,59 @@ async def create_agent_and_run_stream_endpoint(
             yield json.dumps({"type": "error", "detail": str(exc)}, ensure_ascii=False) + "\n"
         except Exception as exc:  # pragma: no cover - runtime safeguard
             yield json.dumps({"type": "error", "detail": f"Agent streaming run failed: {exc}"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/sessions/{session_id}/lats/run",
+    response_model=ResearchRunDetailResponse,
+)
+async def create_lats_and_run_endpoint(
+    project_id: str,
+    session_id: str,
+    payload: ResearchTurnRequest,
+    db: Session = Depends(get_db),
+) -> ResearchRunDetailResponse:
+    try:
+        return create_lats_and_run(db, project_id, session_id, payload)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/sessions/{session_id}/lats/run/stream")
+async def create_lats_and_run_stream_endpoint(
+    project_id: str,
+    session_id: str,
+    payload: ResearchTurnRequest,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    request_payload = {
+        "project_id": project_id,
+        "session_id": session_id,
+        "sequence_id": payload.sequence_id,
+        "user_query": payload.user_query,
+        "asset_ids": payload.asset_ids,
+        "todo_id": payload.todo_id,
+    }
+
+    def event_stream():
+        try:
+            for event in stream_lats_events(
+                db,
+                TurnScopedRequest.model_validate(request_payload),
+            ):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except ValueError as exc:
+            yield json.dumps({"type": "error", "detail": str(exc)}, ensure_ascii=False) + "\n"
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            yield json.dumps({"type": "error", "detail": f"LATS streaming run failed: {exc}"}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(
         event_stream(),

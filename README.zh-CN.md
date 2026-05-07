@@ -26,12 +26,15 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 
 - 项目 CRUD 和仪表盘概览
 - 文本、Markdown 和 PDF 资产的创建、编辑与上传
+- 支持浏览器 MD5、Redis bitmap 进度和 MinIO 分片合并的断点续传上传
 - TODO 的创建、编辑、删除和直接执行
 - 项目级混合检索，支持 dense + BM25 融合
 - 本地 reranker 对证据做最终排序
 - 带引用回答生成
 - 实时/公开信息工具路由，天气类问题优先调用外部天气工具
 - 可选 LATS Agent/MCTS 模式，用于在 RAG、联网、天气、记忆、资产、TODO、计算器和最终回答之间搜索工具决策路径
+- 面向研究场景的 skill/tool registry，包含只读/副作用风险元数据
+- Agent/LATS 搜索树可视化，用于回放决策过程和检查最佳路径
 - working、episodic、semantic 三层记忆
 - 运行历史和详细执行结果查看
 - 由同一个 FastAPI 服务直接提供浏览器工作区
@@ -56,7 +59,7 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 - `BGE-M3`：本地 dense embedding
 - `BM25 + jieba`：词法检索和中文分词
 - `BGE reranker`：本地证据重排
-- `Redis`、`MinIO`、可选 `Ollama`：为后续工作流扩展预留的本地依赖
+- `Redis`、`MinIO`、可选 `Ollama`：用于断点续传进度、对象分片和后续工作流扩展
 
 ## 仓库结构
 
@@ -135,6 +138,10 @@ docker compose --profile llm up -d
 | `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | 语义记忆集合名 |
 | `EXECUTION_MODE` | `plan_and_solve` | 执行模式 |
 | `UPLOAD_MAX_BYTES` | `104857600` | 文件上传大小上限，单位字节 |
+| `RESUMABLE_UPLOAD_MAX_BYTES` | `1073741824` | 断点续传上传大小上限，单位字节 |
+| `RESUMABLE_UPLOAD_CHUNK_SIZE` | `8388608` | 前端分片上传默认分片大小 |
+| `MINIO_BUCKET_RAW` | `agent-raw` | 本地栈创建的原始对象桶 |
+| `MINIO_BUCKET_ARTIFACTS` | `agent-artifacts` | 分片和合并产物对象桶 |
 | `LIVE_TOOLS_ENABLED` | `true` | 是否启用实时/公开信息工具路由 |
 | `LLM_TOOL_PLANNER_ENABLED` | `true` | 是否让 LLM 先决定实时工具，再回退规则 |
 | `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | 单次 LLM 工具规划调用超时时间 |
@@ -150,6 +157,8 @@ docker compose --profile llm up -d
 
 Swagger UI 地址是 `/docs`。
 
+- `GET /api/v1/skills`：查看已注册研究 skill 和可执行工具 schema。
+
 主要接口：
 
 | 接口 | 方法 | 作用 |
@@ -160,7 +169,10 @@ Swagger UI 地址是 `/docs`。
 | `/api/v1/projects` | `GET`, `POST` | 查询或创建项目 |
 | `/api/v1/projects/{project_id}` | `GET`, `PATCH`, `DELETE` | 管理单个项目 |
 | `/api/v1/projects/{project_id}/assets` | `GET`, `POST` | 查询或创建项目资产 |
-| `/api/v1/projects/{project_id}/assets/upload-text` | `POST` | 上传 `.txt` 或 `.md` 资产 |
+| `/api/v1/assets/upload-file` | `POST` | 旧版单请求上传 `.txt`、`.md`、`.markdown`、`.pdf` |
+| `/api/v1/assets/uploads/init` | `POST` | 按 MD5 创建或恢复分片上传 |
+| `/api/v1/assets/uploads/{upload_id}/chunks` | `POST` | 上传单个分片，并写入 Redis bitmap |
+| `/api/v1/assets/uploads/{upload_id}/complete` | `POST` | 合并 MinIO 分片、解析文件并创建资产 |
 | `/api/v1/assets/{asset_id}` | `PATCH`, `DELETE` | 更新或删除单个资产 |
 | `/api/v1/projects/{project_id}/todos` | `GET`, `POST` | 查询或创建 TODO |
 | `/api/v1/todos/{todo_id}` | `PATCH`, `DELETE` | 更新或删除单个 TODO |
@@ -216,7 +228,7 @@ curl http://127.0.0.1:8001/healthz
 
 - 当前 MVP 主要面向文本类和 PDF 研究资产。
 - 浏览器工作区由后端直接提供，更适合本地环境使用。
-- Docker 栈里已经准备了 Redis 和 MinIO，但当前核心研究闭环主要依赖 FastAPI、MySQL、本地检索和 Qdrant。
+- Redis 用于保存断点续传元信息和分片 bitmap；MinIO 用于保存上传分片和合并后的源文件。
 - OCR、报告导出和更完整的工作流集成仍然在路线图中。
 
 ## 文档

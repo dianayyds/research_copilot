@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from io import BytesIO
 import logging
 import math
 import re
@@ -15,11 +16,13 @@ import httpx
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from app.asset_ingest import parse_uploaded_asset
 from app.config import settings
 from app.db_models import Asset, ChatSession, Project, ResearchRun, Todo, WorkingMemoryItem
 from app.live_tools import LiveToolResult, LiveToolRoute, execute_live_tool, select_live_tool
 from app.memory_manager import build_memory_context_bundle, consolidate_layered_memories, list_layered_memories
 from app.models import (
+    AnswerQualityReport,
     AnswerResponse,
     AnswerWithCitationsRequest,
     AssetCreate,
@@ -39,6 +42,9 @@ from app.models import (
     ProjectCreate,
     ProjectResponse,
     ProjectUpdate,
+    ResumableUploadCompleteRequest,
+    ResumableUploadInitRequest,
+    ResumableUploadStatusResponse,
     ResearchRunDetailResponse,
     ResearchTask,
     ResearchTurnRequest,
@@ -50,12 +56,47 @@ from app.models import (
     TurnScopedRequest,
 )
 from app.semantic_store import get_semantic_memory_store
-from app.vector_store import get_vector_store
+from app.vector_store import get_vector_store, tokenize
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 TITLE_QUERY_RE = re.compile(r"[《“\"]([^》”\"]+)[》”\"]")
 LOOKUP_TERMS = ("谁", "作者", "第一作者", "通讯作者", "年份", "哪一年", "单位", "机构", "在哪里")
+MEMORY_INTENT_TERMS = ("刚才", "之前", "前面", "上面", "记忆", "记住", "历史", "对话", "上一轮", "上次")
+CONCEPT_OVERVIEW_TERMS = (
+    "讲一讲",
+    "讲讲",
+    "介绍一下",
+    "介绍",
+    "概述",
+    "解释一下",
+    "解释",
+    "说说",
+    "科普",
+    "是什么",
+    "定义",
+    "原理",
+)
+MEMORY_STOP_TERMS = {
+    "请",
+    "帮",
+    "我",
+    "一下",
+    "讲",
+    "讲讲",
+    "一讲",
+    "介绍",
+    "概述",
+    "解释",
+    "说说",
+    "科普",
+    "什么",
+    "是什么",
+    "这个",
+    "那个",
+    "如何",
+    "怎么",
+}
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -82,6 +123,20 @@ class AgentToolSpec:
     name: str
     description: str
     input_schema: dict[str, object]
+    skill: str = "general_research"
+    intent: str = ""
+    read_only: bool = True
+    risk_level: str = "low"
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ResearchSkillSpec:
+    name: str
+    title: str
+    description: str
+    tool_names: tuple[str, ...]
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -463,6 +518,277 @@ def delete_asset(db: Session, asset_id: str) -> None:
     db.commit()
 
 
+def normalize_file_md5(file_md5: str) -> str:
+    normalized = file_md5.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", normalized):
+        raise ValueError("file_md5 must be a 32-character hexadecimal MD5")
+    return normalized
+
+
+def resumable_upload_meta_key(upload_id: str) -> str:
+    return f"asset-upload:{upload_id}:meta"
+
+
+def resumable_upload_bitmap_key(upload_id: str) -> str:
+    return f"asset-upload:{upload_id}:chunks"
+
+
+def safe_object_name(filename: str) -> str:
+    basename = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].strip() or "upload"
+    return re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+", "_", basename)[:180] or "upload"
+
+
+class RedisUploadProgressStore:
+    def __init__(self) -> None:
+        from redis import Redis
+
+        self.client = Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            decode_responses=True,
+        )
+
+    def save_meta(self, upload_id: str, meta: dict[str, object]) -> None:
+        payload = {key: str(value) for key, value in meta.items() if value is not None}
+        self.client.hset(resumable_upload_meta_key(upload_id), mapping=payload)
+
+    def get_meta(self, upload_id: str) -> dict[str, str]:
+        return dict(self.client.hgetall(resumable_upload_meta_key(upload_id)))
+
+    def mark_chunk_uploaded(self, upload_id: str, chunk_index: int) -> None:
+        self.client.setbit(resumable_upload_bitmap_key(upload_id), chunk_index, 1)
+
+    def uploaded_chunks(self, upload_id: str, total_chunks: int) -> list[int]:
+        bitmap_key = resumable_upload_bitmap_key(upload_id)
+        return [index for index in range(total_chunks) if int(self.client.getbit(bitmap_key, index))]
+
+
+class MinioChunkStorage:
+    def __init__(self) -> None:
+        from minio import Minio
+
+        self.client = Minio(
+            f"{settings.minio_host}:{settings.minio_port}",
+            access_key=settings.minio_access_key,
+            secret_key=settings.minio_secret_key,
+            secure=settings.minio_secure,
+        )
+        self.bucket = settings.minio_bucket_artifacts
+        if not self.client.bucket_exists(self.bucket):
+            self.client.make_bucket(self.bucket)
+
+    def chunk_object_key(self, upload_id: str, chunk_index: int) -> str:
+        return f"resumable-assets/{upload_id}/chunks/{chunk_index:08d}.part"
+
+    def final_object_key(self, upload_id: str, filename: str) -> str:
+        return f"resumable-assets/{upload_id}/final/{safe_object_name(filename)}"
+
+    def put_chunk(self, upload_id: str, chunk_index: int, data: bytes, content_type: str) -> str:
+        object_key = self.chunk_object_key(upload_id, chunk_index)
+        self.client.put_object(
+            self.bucket,
+            object_key,
+            BytesIO(data),
+            length=len(data),
+            content_type=content_type or "application/octet-stream",
+        )
+        return object_key
+
+    def compose_chunks(self, upload_id: str, total_chunks: int, final_object_key: str) -> str:
+        if total_chunks <= 0:
+            raise ValueError("total_chunks must be positive")
+        if total_chunks == 1:
+            from minio.commonconfig import CopySource
+
+            self.client.copy_object(
+                self.bucket,
+                final_object_key,
+                CopySource(self.bucket, self.chunk_object_key(upload_id, 0)),
+            )
+            return final_object_key
+        from minio.commonconfig import ComposeSource
+
+        sources = [
+            ComposeSource(self.bucket, self.chunk_object_key(upload_id, chunk_index))
+            for chunk_index in range(total_chunks)
+        ]
+        self.client.compose_object(self.bucket, final_object_key, sources)
+        return final_object_key
+
+    def read_object(self, object_key: str) -> bytes:
+        response = self.client.get_object(self.bucket, object_key)
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()
+
+
+_upload_progress_store: RedisUploadProgressStore | None = None
+_chunk_storage: MinioChunkStorage | None = None
+
+
+def get_upload_progress_store() -> RedisUploadProgressStore:
+    global _upload_progress_store
+    if _upload_progress_store is None:
+        _upload_progress_store = RedisUploadProgressStore()
+    return _upload_progress_store
+
+
+def get_chunk_storage() -> MinioChunkStorage:
+    global _chunk_storage
+    if _chunk_storage is None:
+        _chunk_storage = MinioChunkStorage()
+    return _chunk_storage
+
+
+def total_chunks_for(file_size: int, chunk_size: int) -> int:
+    return max(1, math.ceil(file_size / chunk_size))
+
+
+def resumable_upload_status(
+    db: Session,
+    upload_id: str,
+    *,
+    store: RedisUploadProgressStore | None = None,
+) -> ResumableUploadStatusResponse:
+    progress_store = store or get_upload_progress_store()
+    meta = progress_store.get_meta(upload_id)
+    if not meta:
+        raise ValueError(f"Upload {upload_id} not found")
+    total_chunks = int(meta["total_chunks"])
+    uploaded_chunks = progress_store.uploaded_chunks(upload_id, total_chunks)
+    uploaded_set = set(uploaded_chunks)
+    missing_chunks = [index for index in range(total_chunks) if index not in uploaded_set]
+    asset = db.get(Asset, meta.get("asset_id", "")) if meta.get("asset_id") else None
+    return ResumableUploadStatusResponse(
+        upload_id=upload_id,
+        file_md5=meta["file_md5"],
+        filename=meta["filename"],
+        file_size=int(meta["file_size"]),
+        chunk_size=int(meta["chunk_size"]),
+        total_chunks=total_chunks,
+        uploaded_chunks=uploaded_chunks,
+        missing_chunks=missing_chunks,
+        uploaded_count=len(uploaded_chunks),
+        complete=len(uploaded_chunks) == total_chunks,
+        finalized=meta.get("status") == "finalized",
+        asset=asset_to_response(asset) if asset else None,
+    )
+
+
+def init_resumable_asset_upload(
+    db: Session,
+    payload: ResumableUploadInitRequest,
+) -> ResumableUploadStatusResponse:
+    file_md5 = normalize_file_md5(payload.file_md5)
+    if payload.file_size > settings.resumable_upload_max_bytes:
+        raise ValueError(f"Uploaded file exceeds {settings.resumable_upload_max_bytes} bytes")
+    chunk_size = min(max(payload.chunk_size, 1), settings.resumable_upload_chunk_size)
+    total_chunks = total_chunks_for(payload.file_size, chunk_size)
+    upload_id = file_md5
+    store = get_upload_progress_store()
+    existing = store.get_meta(upload_id)
+    if not existing:
+        now = utc_now().isoformat()
+        store.save_meta(
+            upload_id,
+            {
+                "upload_id": upload_id,
+                "file_md5": file_md5,
+                "filename": payload.filename,
+                "file_size": payload.file_size,
+                "chunk_size": chunk_size,
+                "total_chunks": total_chunks,
+                "title": payload.title or "",
+                "asset_type": payload.asset_type or "",
+                "status": "uploading",
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+    return resumable_upload_status(db, upload_id, store=store)
+
+
+def upload_resumable_asset_chunk(
+    db: Session,
+    upload_id: str,
+    *,
+    chunk_index: int,
+    data: bytes,
+    content_type: str,
+) -> ResumableUploadStatusResponse:
+    upload_id = normalize_file_md5(upload_id)
+    store = get_upload_progress_store()
+    meta = store.get_meta(upload_id)
+    if not meta:
+        raise ValueError(f"Upload {upload_id} not found")
+    if meta.get("status") == "finalized":
+        return resumable_upload_status(db, upload_id, store=store)
+    total_chunks = int(meta["total_chunks"])
+    chunk_size = int(meta["chunk_size"])
+    file_size = int(meta["file_size"])
+    if chunk_index < 0 or chunk_index >= total_chunks:
+        raise ValueError("chunk_index out of range")
+    expected_size = chunk_size if chunk_index < total_chunks - 1 else file_size - chunk_size * (total_chunks - 1)
+    if len(data) != expected_size:
+        raise ValueError(f"Chunk {chunk_index} size mismatch: expected {expected_size}, got {len(data)}")
+    storage = get_chunk_storage()
+    storage.put_chunk(upload_id, chunk_index, data, content_type)
+    store.mark_chunk_uploaded(upload_id, chunk_index)
+    store.save_meta(upload_id, {"updated_at": utc_now().isoformat(), "status": "uploading"})
+    return resumable_upload_status(db, upload_id, store=store)
+
+
+def complete_resumable_asset_upload(
+    db: Session,
+    upload_id: str,
+    payload: ResumableUploadCompleteRequest,
+) -> ResumableUploadStatusResponse:
+    upload_id = normalize_file_md5(upload_id)
+    store = get_upload_progress_store()
+    meta = store.get_meta(upload_id)
+    if not meta:
+        raise ValueError(f"Upload {upload_id} not found")
+    if meta.get("status") == "finalized":
+        return resumable_upload_status(db, upload_id, store=store)
+    status = resumable_upload_status(db, upload_id, store=store)
+    if status.missing_chunks:
+        raise ValueError(f"Upload is incomplete; missing chunks: {status.missing_chunks[:10]}")
+    storage = get_chunk_storage()
+    final_key = meta.get("final_object_key") or storage.final_object_key(upload_id, meta["filename"])
+    storage.compose_chunks(upload_id, int(meta["total_chunks"]), final_key)
+    raw = storage.read_object(final_key)
+    import hashlib
+
+    if hashlib.md5(raw).hexdigest() != upload_id:
+        raise ValueError("Merged object MD5 does not match upload_id")
+    parsed = parse_uploaded_asset(
+        filename=meta["filename"],
+        raw=raw,
+        title=payload.title or meta.get("title") or None,
+        asset_type=payload.asset_type or meta.get("asset_type") or None,
+    )
+    asset = create_asset(
+        db,
+        AssetCreate(
+            title=parsed.title,
+            asset_type=parsed.asset_type,
+            content=parsed.content,
+        ),
+    )
+    store.save_meta(
+        upload_id,
+        {
+            "status": "finalized",
+            "asset_id": asset.id,
+            "final_object_key": final_key,
+            "updated_at": utc_now().isoformat(),
+        },
+    )
+    return resumable_upload_status(db, upload_id, store=store)
+
+
 def list_todos(db: Session, project_id: str) -> list[TodoResponse]:
     get_project(db, project_id)
     todos = db.scalars(select(Todo).where(Todo.project_id == project_id).order_by(desc(Todo.updated_at))).all()
@@ -598,6 +924,102 @@ def quoted_title(text: str) -> str:
 
 def is_lookup_query(text: str) -> bool:
     return any(term in text for term in LOOKUP_TERMS)
+
+
+def has_any_term(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
+
+
+def is_memory_intent_query(text: str) -> bool:
+    return has_any_term(text, MEMORY_INTENT_TERMS)
+
+
+def is_concept_overview_query(text: str) -> bool:
+    return has_any_term(text, CONCEPT_OVERVIEW_TERMS) and not is_lookup_query(text)
+
+
+def concept_overview_search_query(query: str) -> str:
+    subject = quoted_title(query) or query
+    subject = re.sub(r"^(请|帮我|帮忙|麻烦)?\s*", "", subject).strip()
+    for term in CONCEPT_OVERVIEW_TERMS:
+        subject = subject.replace(term, " ")
+    subject = compact_text(re.sub(r"\s+", " ", subject), 80).strip(" ，。！？?、")
+    return f"{subject or query} 定义 原理 应用".strip()
+
+
+def memory_query_terms(query: str) -> list[str]:
+    candidates = list(tokenize(query)) + list(tokenize(concept_overview_search_query(query)))
+    for piece in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9_./+-]{2,}", query):
+        cleaned = piece
+        for term in CONCEPT_OVERVIEW_TERMS:
+            cleaned = cleaned.replace(term, "")
+        if cleaned:
+            candidates.append(cleaned)
+            if re.fullmatch(r"[\u4e00-\u9fff]+", cleaned):
+                for size in (2, 3, 4):
+                    candidates.extend(cleaned[index : index + size] for index in range(0, max(len(cleaned) - size + 1, 0)))
+    terms: list[str] = []
+    for term in candidates:
+        normalized = term.strip().lower()
+        if len(normalized) < 2 or normalized in MEMORY_STOP_TERMS:
+            continue
+        if normalized not in terms:
+            terms.append(normalized)
+    return terms[:24]
+
+
+def memory_line_score(query: str, line: str) -> float:
+    terms = memory_query_terms(query)
+    if not terms:
+        return 0.0
+    lowered = line.lower()
+    line_tokens = set(tokenize(line))
+    score = 0.0
+    for term in terms:
+        if term in lowered:
+            score += 1.0
+        elif term in line_tokens:
+            score += 0.7
+    return score
+
+
+def focused_memory_observation_text(bundle, query: str, *, limit: int = 6) -> tuple[str, int]:
+    sections = [
+        ("Working Memory", bundle.working_lines),
+        ("Episodic Memory", bundle.episodic_lines),
+        ("Semantic Memory", bundle.semantic_lines),
+    ]
+    scored: list[tuple[float, int, str, str]] = []
+    order = 0
+    for section, lines in sections:
+        for line in lines:
+            order += 1
+            score = memory_line_score(query, line)
+            if score > 0:
+                scored.append((score, order, section, line))
+    if not scored and is_memory_intent_query(query):
+        for section, lines in sections:
+            for line in lines:
+                order += 1
+                if line.strip():
+                    scored.append((0.1, order, section, line))
+                if len(scored) >= limit:
+                    break
+            if len(scored) >= limit:
+                break
+    if not scored:
+        return f"没有找到与“{compact_text(query, 80)}”直接相关的项目记忆。", 0
+    selected = sorted(scored, key=lambda item: (-item[0], item[1]))[:limit]
+    grouped: dict[str, list[str]] = {}
+    for _, _, section, line in selected:
+        grouped.setdefault(section, []).append(line)
+    lines: list[str] = []
+    for section, _ in sections:
+        if section not in grouped:
+            continue
+        lines.append(f"### Relevant {section}")
+        lines.extend(grouped[section])
+    return "\n".join(lines), len(selected)
 
 
 def planned_search_queries(
@@ -1226,6 +1648,157 @@ def contains_restrictive_fallback_text(text: str) -> bool:
     return any(term in text for term in DIRECT_FALLBACK_RESTRICTIVE_TERMS)
 
 
+def answer_quality_level(score: float) -> str:
+    if score >= 4.25:
+        return "high"
+    if score >= 3.25:
+        return "medium"
+    if score >= 2.0:
+        return "low"
+    return "failing"
+
+
+def clamp_quality_score(score: float) -> float:
+    return round(max(0.0, min(5.0, score)), 2)
+
+
+def assess_answer_quality(
+    plan: PlanTasksResponse,
+    retrieval: RetrieveResponse,
+    answer: AnswerResponse,
+    memory: ConsolidateMemoryResponse | None = None,
+) -> AnswerQualityReport:
+    score = 0.0
+    signals: list[str] = []
+    gaps: list[str] = []
+    next_actions: list[str] = []
+    answer_text = answer.answer.strip()
+    fallback_used = False
+    if answer_text:
+        score += 1.0
+        signals.append("answer_present")
+    else:
+        gaps.append("empty_answer")
+        next_actions.append("retry_with_clearer_final_synthesis")
+
+    if plan.execution_trace:
+        score += 0.8
+        signals.append(f"trace_steps:{len(plan.execution_trace)}")
+    else:
+        gaps.append("missing_execution_trace")
+        next_actions.append("record_plan_act_observe_trace")
+
+    if plan.solver_summary:
+        score += 0.4
+        signals.append("solver_summary_present")
+    else:
+        gaps.append("missing_solver_summary")
+
+    failed_steps = [
+        step
+        for step in plan.execution_trace
+        if step.status not in {"completed", "skipped"} or "失败" in step.summary or "failed" in step.summary.lower()
+    ]
+    if failed_steps:
+        gaps.append(f"failed_steps:{len(failed_steps)}")
+        next_actions.append("inspect_failed_tools_and_retry_with_fallback")
+    else:
+        score += 0.5
+        signals.append("no_failed_trace_steps")
+
+    if retrieval.evidence_items:
+        score += 1.0
+        top_score = max(item.score for item in retrieval.evidence_items)
+        signals.append(f"evidence_items:{len(retrieval.evidence_items)}")
+        if top_score >= 0.35:
+            score += 0.4
+            signals.append("strong_top_evidence")
+        elif top_score >= 0.18:
+            score += 0.2
+            signals.append("usable_top_evidence")
+        else:
+            gaps.append("weak_top_evidence")
+            next_actions.append("broaden_or_refine_retrieval_queries")
+    else:
+        gaps.append("no_retrieved_evidence")
+        next_actions.append("import_relevant_assets_or_use_verified_live_tool")
+
+    if answer.citations:
+        evidence_labels_set = {item.label for item in retrieval.evidence_items}
+        citation_labels = {citation.label for citation in answer.citations}
+        score += 1.0
+        signals.append(f"citations:{len(answer.citations)}")
+        if citation_labels <= evidence_labels_set:
+            score += 0.3
+            signals.append("citations_match_evidence")
+        else:
+            gaps.append("citation_label_not_in_evidence")
+            next_actions.append("rebuild_citations_from_retrieved_evidence")
+    elif retrieval.evidence_items:
+        gaps.append("retrieved_evidence_not_cited")
+        next_actions.append("cite_supporting_evidence_or_mark_answer_uncited")
+    else:
+        gaps.append("uncited_answer")
+
+    if retrieval.evidence_items and answer.citations and answer_text:
+        score += 0.5
+        signals.append("grounded_answer")
+
+    if plan.replan_count:
+        signals.append(f"replan_count:{plan.replan_count}")
+
+    if contains_restrictive_fallback_text(answer_text):
+        score -= 1.0
+        fallback_used = True
+        gaps.append("restrictive_fallback_text")
+        next_actions.append("replace_internal_failure_text_with_user_facing_answer_or_error")
+
+    fallback_steps = [
+        step
+        for step in plan.execution_trace
+        if "fallback" in step.step_id.lower() or "fallback" in step.title.lower() or "兜底" in step.summary
+    ]
+    if fallback_steps:
+        fallback_used = True
+        gaps.append(f"fallback_steps:{len(fallback_steps)}")
+        next_actions.append("rerun_with_more_specific_context_or_verified_sources")
+
+    if 0 < len(answer_text) < 20:
+        score -= 0.3
+        gaps.append("very_short_answer")
+        next_actions.append("expand_answer_with_key_reasoning_and_next_step")
+
+    if memory and memory.memory_updates:
+        score += 0.2
+        signals.append(f"memory_updates:{len(memory.memory_updates)}")
+
+    unique_gaps = dedupe_preserve_order(gaps)
+    if not next_actions:
+        next_actions.append("continue_with_follow_up_or_expand_from_current_citations")
+    final_score = clamp_quality_score(score)
+    return AnswerQualityReport(
+        score=final_score,
+        level=answer_quality_level(final_score),
+        evidence_count=len(retrieval.evidence_items),
+        citation_count=len(answer.citations),
+        answer_length=len(answer_text),
+        grounded=bool(retrieval.evidence_items and answer.citations and answer_text and not fallback_used),
+        fallback_used=fallback_used,
+        signals=dedupe_preserve_order(signals),
+        gaps=unique_gaps,
+        next_actions=dedupe_preserve_order(next_actions),
+    )
+
+
+def attach_answer_quality(
+    plan: PlanTasksResponse,
+    retrieval: RetrieveResponse,
+    answer: AnswerResponse,
+    memory: ConsolidateMemoryResponse | None = None,
+) -> AnswerResponse:
+    return answer.model_copy(update={"quality": assess_answer_quality(plan, retrieval, answer, memory)})
+
+
 def direct_llm_answer(
     request: TurnScopedRequest,
     *,
@@ -1302,6 +1875,102 @@ def try_direct_llm_answer(
         return ""
 
 
+def evidence_brief_text(evidence_items: list[EvidenceItem], *, limit: int = 5) -> str:
+    return "\n".join(
+        f"[{item.label}] {item.title}\n{item.snippet}\nsource={item.source_path}"
+        for item in evidence_items[:limit]
+    )
+
+
+def llm_agent_synthesize_answer(
+    request: TurnScopedRequest,
+    *,
+    mode: str,
+    final_text: str,
+    history: list[dict[str, object]],
+    evidence_items: list[EvidenceItem],
+) -> str:
+    payload = {
+        "mode": mode,
+        "current_date": utc_now().date().isoformat(),
+        "user_query": request.user_query,
+        "draft_final_answer": compact_text(final_text, 1200),
+        "tool_history": agent_history_text(history)[-5000:],
+        "evidence": evidence_brief_text(evidence_items),
+    }
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot 的最终答案综合器。只回答用户当前问题，"
+                        "不要复述工具轨迹、执行日志、无关记忆或内部评分。"
+                        "如果提供了 draft_final_answer，把它当草稿而不是必须原样输出。"
+                        "如果提供了 evidence，可用 [C1] 这类标签引用；没有 evidence 时不要编造引用。"
+                        "遇到记忆内容时，只抽取和用户问题直接相关的信息。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": "请基于以下 JSON 综合最终回答：\n"
+                    f"{json.dumps(payload, ensure_ascii=False, default=str)}",
+                },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 900,
+        },
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return str(data["choices"][0]["message"]["content"]).strip()
+
+
+def fallback_agent_synthesize_answer(
+    final_text: str,
+    history: list[dict[str, object]],
+    evidence_items: list[EvidenceItem],
+) -> str:
+    if final_text.strip():
+        return final_text.strip()
+    if evidence_items:
+        lines = [
+            f"[{item.label}] {item.title}: {item.snippet}"
+            for item in evidence_items[: min(len(evidence_items), 5)]
+        ]
+        labels = ", ".join(item.label for item in evidence_items[:3])
+        return "\n".join([*lines, "", f"引用：{labels}"]).strip()
+    return summarize_agent_observations(history)
+
+
+def synthesize_agent_answer(
+    request: TurnScopedRequest,
+    *,
+    mode: str,
+    final_text: str,
+    history: list[dict[str, object]],
+    evidence_items: list[EvidenceItem],
+) -> tuple[str, bool]:
+    if llm_available():
+        try:
+            answer = llm_agent_synthesize_answer(
+                request,
+                mode=mode,
+                final_text=final_text,
+                history=history,
+                evidence_items=evidence_items,
+            )
+            if answer.strip() and not contains_restrictive_fallback_text(answer):
+                return answer, True
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("agent_answer_synthesis_failed mode=%s error=%s", mode, exc)
+    return fallback_agent_synthesize_answer(final_text, history, evidence_items), False
+
+
 def agent_should_use_direct_llm_fallback(
     answer_text: str,
     history: list[dict[str, object]],
@@ -1317,61 +1986,236 @@ def agent_should_use_direct_llm_fallback(
     return False
 
 
-def agent_tool_catalog() -> list[AgentToolSpec]:
-    return [
+_RESEARCH_SKILL_REGISTRY: dict[str, ResearchSkillSpec] = {}
+_AGENT_TOOL_REGISTRY: dict[str, AgentToolSpec] = {}
+
+
+def register_research_skill(spec: ResearchSkillSpec) -> ResearchSkillSpec:
+    _RESEARCH_SKILL_REGISTRY[spec.name] = spec
+    return spec
+
+
+def register_agent_tool(spec: AgentToolSpec) -> AgentToolSpec:
+    _AGENT_TOOL_REGISTRY[spec.name] = spec
+    return spec
+
+
+def ensure_research_tool_registry() -> None:
+    if _RESEARCH_SKILL_REGISTRY and _AGENT_TOOL_REGISTRY:
+        return
+    _RESEARCH_SKILL_REGISTRY.clear()
+    _AGENT_TOOL_REGISTRY.clear()
+    for spec in (
+        ResearchSkillSpec(
+            name="project_literature_rag",
+            title="项目文献检索",
+            description="检索已导入论文、笔记和项目资料，形成带引用的研究回答。",
+            tool_names=("local_rag_search",),
+            tags=("rag", "citation", "literature"),
+        ),
+        ResearchSkillSpec(
+            name="public_literature_lookup",
+            title="公开资料检索",
+            description="查询公开网络资料、官网摘要和最新公开事实，用于补足项目外信息。",
+            tool_names=("public_web_search",),
+            tags=("web", "freshness", "public-source"),
+        ),
+        ResearchSkillSpec(
+            name="research_memory",
+            title="研究记忆回溯",
+            description="读取项目 working、episodic、semantic memory，适合追问前文和长期研究线索。",
+            tool_names=("memory_read",),
+            tags=("memory", "context"),
+        ),
+        ResearchSkillSpec(
+            name="asset_inventory",
+            title="资料资产盘点",
+            description="列出当前知识库资产，帮助确认已导入论文、笔记和数据。",
+            tool_names=("asset_list",),
+            tags=("asset", "inventory"),
+        ),
+        ResearchSkillSpec(
+            name="quantitative_check",
+            title="定量校验",
+            description="执行简单算术和数值 sanity check，辅助实验结果、指标和比例核算。",
+            tool_names=("calculator",),
+            tags=("calculation", "experiment"),
+        ),
+        ResearchSkillSpec(
+            name="research_task_management",
+            title="研究任务管理",
+            description="查看或创建项目 TODO，用于沉淀阅读、实验和写作任务。",
+            tool_names=("todo_list", "todo_create"),
+            tags=("todo", "workflow"),
+        ),
+        ResearchSkillSpec(
+            name="fieldwork_context",
+            title="外出调研环境",
+            description="查询天气等实时环境信息，适合外出调研、会议或采样活动判断。",
+            tool_names=("weather_lookup",),
+            tags=("weather", "fieldwork"),
+        ),
+        ResearchSkillSpec(
+            name="research_memory_write",
+            title="研究偏好记录",
+            description="在用户明确要求时写入短期工作记忆，用于保存研究约束和偏好。",
+            tool_names=("memory_write",),
+            tags=("memory", "write"),
+        ),
+    ):
+        register_research_skill(spec)
+    for spec in (
         AgentToolSpec(
             name="local_rag_search",
+            skill="project_literature_rag",
+            intent="project_evidence_lookup",
             description="检索本项目/全局知识库中的资产内容，适用于论文、代码说明、项目资料和需要引用本地证据的问题。",
             input_schema={"query": "检索问题，字符串"},
+            read_only=True,
+            risk_level="low",
+            tags=("rag", "citation", "literature"),
         ),
         AgentToolSpec(
             name="weather_lookup",
+            skill="fieldwork_context",
+            intent="realtime_weather",
             description="查询实时天气事实，适用于天气、气温、降水、风速、出行或活动适宜性判断。",
             input_schema={"query": "包含城市/地点的天气问题，字符串"},
+            read_only=True,
+            risk_level="low",
+            tags=("weather", "realtime"),
         ),
         AgentToolSpec(
             name="public_web_search",
+            skill="public_literature_lookup",
+            intent="public_web_lookup",
             description="查询公开网络摘要，适用于最新信息、官网、公开事实或用户明确要求联网搜索的问题。",
             input_schema={"query": "搜索问题，字符串"},
+            read_only=True,
+            risk_level="medium",
+            tags=("web", "freshness"),
         ),
         AgentToolSpec(
             name="memory_read",
+            skill="research_memory",
+            intent="memory_lookup",
             description="读取当前项目的 working/episodic/semantic memory，适用于刚才说过什么、项目记住了什么、用户偏好等问题。",
             input_schema={"query": "记忆检索问题，字符串，可省略"},
+            read_only=True,
+            risk_level="low",
+            tags=("memory", "context"),
         ),
         AgentToolSpec(
             name="memory_write",
+            skill="research_memory_write",
+            intent="memory_write",
             description="写入一条短期工作记忆，适用于用户明确要求记住某个偏好、约束或事实。",
             input_schema={"key": "记忆键", "content": "要记住的内容", "importance": "0-1，可选"},
+            read_only=False,
+            risk_level="medium",
+            tags=("memory", "side-effect"),
         ),
         AgentToolSpec(
             name="todo_create",
+            skill="research_task_management",
+            intent="todo_create",
             description="为当前项目创建 TODO。",
             input_schema={"title": "TODO 标题", "description": "描述，可选", "priority": "low|medium|high，可选"},
+            read_only=False,
+            risk_level="medium",
+            tags=("todo", "side-effect"),
         ),
         AgentToolSpec(
             name="todo_list",
+            skill="research_task_management",
+            intent="todo_list",
             description="列出当前项目 TODO。",
             input_schema={"status": "可选，按状态过滤"},
+            read_only=True,
+            risk_level="low",
+            tags=("todo", "inventory"),
         ),
         AgentToolSpec(
             name="asset_list",
+            skill="asset_inventory",
+            intent="asset_inventory",
             description="列出全局知识库资产，适用于用户询问有哪些资料/文档/资产。",
             input_schema={},
+            read_only=True,
+            risk_level="low",
+            tags=("asset", "inventory"),
         ),
         AgentToolSpec(
             name="calculator",
+            skill="quantitative_check",
+            intent="calculation",
             description="计算简单算术表达式，支持 + - * / // % ** 和括号。",
             input_schema={"expression": "算术表达式，字符串"},
+            read_only=True,
+            risk_level="low",
+            tags=("calculation", "experiment"),
         ),
+    ):
+        register_agent_tool(spec)
+
+
+def research_skill_registry() -> dict[str, ResearchSkillSpec]:
+    ensure_research_tool_registry()
+    return dict(_RESEARCH_SKILL_REGISTRY)
+
+
+def agent_tool_registry() -> dict[str, AgentToolSpec]:
+    ensure_research_tool_registry()
+    return dict(_AGENT_TOOL_REGISTRY)
+
+
+def list_research_skills_payload() -> list[dict[str, object]]:
+    return [
+        {
+            "name": skill.name,
+            "title": skill.title,
+            "description": skill.description,
+            "tool_names": list(skill.tool_names),
+            "tags": list(skill.tags),
+        }
+        for skill in research_skill_registry().values()
     ]
+
+
+def agent_tool_spec_payload(tool: AgentToolSpec) -> dict[str, object]:
+    return {
+        "name": tool.name,
+        "skill": tool.skill,
+        "intent": tool.intent,
+        "description": tool.description,
+        "input_schema": tool.input_schema,
+        "read_only": tool.read_only,
+        "risk_level": tool.risk_level,
+        "tags": list(tool.tags),
+    }
+
+
+def list_agent_tools_payload(*, read_only_only: bool = False) -> list[dict[str, object]]:
+    return [
+        agent_tool_spec_payload(tool)
+        for tool in agent_tool_registry().values()
+        if not read_only_only or tool.read_only
+    ]
+
+
+def skill_tool_registry_payload() -> dict[str, object]:
+    return {
+        "skills": list_research_skills_payload(),
+        "tools": list_agent_tools_payload(),
+    }
+
+
+def agent_tool_catalog() -> list[AgentToolSpec]:
+    return list(agent_tool_registry().values())
 
 
 def agent_tool_catalog_payload() -> list[dict[str, object]]:
-    return [
-        {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
-        for tool in agent_tool_catalog()
-    ]
+    return [agent_tool_spec_payload(tool) for tool in agent_tool_catalog()]
 
 
 def agent_plan(request: TurnScopedRequest) -> PlanTasksResponse:
@@ -1677,12 +2521,13 @@ def execute_agent_tool(
     if action == "memory_read":
         query = str(arguments.get("query") or request.user_query)
         bundle = build_memory_context_bundle(db, request.project_id, request.session_id, query)
+        memory_text, match_count = focused_memory_observation_text(bundle, query)
         return AgentToolObservation(
             tool_name=action,
-            summary="读取项目分层记忆。",
-            content=bundle.combined_text,
+            summary=f"读取项目分层记忆，筛出 {match_count} 条相关片段。",
+            content=memory_text,
             evidence_items=[],
-            metadata={"query": query},
+            metadata={"query": query, "match_count": match_count},
         )
     if action == "memory_write":
         key = compact_text(str(arguments.get("key") or "agent_note"), 64)
@@ -1906,12 +2751,18 @@ def execute_agent_plan(
             )
         )
     if not final_text.strip():
-        final_text = agent_final_answer_from_history(request, history, "", evidence_items)
+        final_text, synthesized = synthesize_agent_answer(
+            request,
+            mode="agent_loop",
+            final_text="",
+            history=history,
+            evidence_items=evidence_items,
+        )
         append_step(
             PlanExecutionStep(
-                step_id="agent-final-fallback",
+                step_id="agent-final-synthesis",
                 task_id="task-4",
-                title="Agent final fallback",
+                title="Agent final synthesis" if synthesized else "Agent final fallback",
                 action="agent_final",
                 summary=compact_text(final_text, 260),
                 evidence_labels=[item.label for item in evidence_items],
@@ -1924,7 +2775,7 @@ def execute_agent_plan(
         retrieval_mode="agent_tool_loop",
         evidence_items=evidence_items,
     )
-    answer_text = agent_final_answer_from_history(request, history, final_text, evidence_items)
+    answer_text = final_text.strip()
     direct_fallback_used = False
     if agent_should_use_direct_llm_fallback(answer_text, history, evidence_items):
         fallback = try_direct_llm_answer(
@@ -2035,22 +2886,13 @@ def dedupe_relabel_evidence(items: list[EvidenceItem]) -> list[EvidenceItem]:
 
 
 def lats_safe_actions() -> set[str]:
-    return {
-        "local_rag_search",
-        "weather_lookup",
-        "public_web_search",
-        "memory_read",
-        "todo_list",
-        "asset_list",
-        "calculator",
-        "final_answer",
-    }
+    return {tool.name for tool in agent_tool_catalog() if tool.read_only} | {"final_answer"}
 
 
 def lats_tool_catalog_payload() -> list[dict[str, object]]:
     safe_actions = lats_safe_actions()
     payload = [
-        {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
+        agent_tool_spec_payload(tool)
         for tool in agent_tool_catalog()
         if tool.name in safe_actions
     ]
@@ -2137,17 +2979,28 @@ def fallback_lats_candidate_actions(
     last_tool = str(last_observation.get("tool") or "")
     last_content = str(last_observation.get("content") or "")
     candidates: list[tuple[AgentDecision, float]] = []
+    concept_overview = is_concept_overview_query(query) and not is_memory_intent_query(query)
 
     if observations:
         has_success = any(not (isinstance(item.get("metadata"), dict) and item["metadata"].get("error")) for item in observations)
         has_useful_content = has_success and not any(marker in last_content for marker in ("没有命中", "没有返回", "当前没有"))
-        if has_useful_content:
+        memory_only_path = concept_overview and bool(called_tools) and called_tools <= {"memory_read"}
+        if has_useful_content and not memory_only_path:
             candidates.append(
                 lats_candidate(
                     "已有可用 observation，尝试结束并综合回答。",
                     "final_answer",
                     {"answer": summarize_agent_observations(history)},
                     0.94,
+                )
+            )
+        if memory_only_path and "local_rag_search" not in called_tools:
+            candidates.append(
+                lats_candidate(
+                    "概念讲解不能只靠记忆，继续检索项目资料。",
+                    "local_rag_search",
+                    {"query": concept_overview_search_query(query)},
+                    0.82,
                 )
             )
         if last_tool == "local_rag_search" and "public_web_search" not in called_tools and settings.public_web_search_enabled:
@@ -2189,13 +3042,23 @@ def fallback_lats_candidate_actions(
         candidates.append(lats_candidate("用户询问 TODO 列表。", "todo_list", {}, 0.82))
     if any(term in query for term in ("资产", "文档", "资料")):
         candidates.append(lats_candidate("用户询问资产资料。", "asset_list", {}, 0.78))
+    if concept_overview:
+        candidates.append(
+            lats_candidate(
+                "概念讲解类问题优先检索项目资料，再综合成解释。",
+                "local_rag_search",
+                {"query": concept_overview_search_query(query)},
+                0.88,
+            )
+        )
     if any(term in query for term in ("记忆", "刚才", "记住", "之前")):
         candidates.append(lats_candidate("用户询问记忆内容。", "memory_read", {"query": query}, 0.8))
     if settings.public_web_search_enabled and any(
         term in query for term in ("联网", "搜索", "最新", "新闻", "官网", "公开资料", "今天", "今年", "现在", "当前", "年龄", "多大", "几岁")
     ):
         candidates.append(lats_candidate("问题可能需要公开或时效信息。", "public_web_search", {"query": query}, 0.74))
-    candidates.append(lats_candidate("从项目知识库检索本地证据。", "local_rag_search", {"query": query}, 0.68))
+    if not any(decision.action == "local_rag_search" for decision, _ in candidates):
+        candidates.append(lats_candidate("从项目知识库检索本地证据。", "local_rag_search", {"query": query}, 0.68))
     return dedupe_lats_candidates(candidates, limit=limit)
 
 
@@ -2236,6 +3099,9 @@ def llm_lats_candidate_actions(
                         "- 每个动作必须互相有差异，便于树搜索比较。\n"
                         "- 有 observation 且足够回答时，包含 final_answer 分支。\n"
                         "- 工具失败或证据不足时，提出替代工具分支。\n\n"
+                        "- 对“讲一讲/介绍/概述/是什么”等概念讲解问题，优先 local_rag_search，"
+                        "query 应覆盖主题、定义、原理、应用。\n"
+                        "- 除非用户明确询问刚才/之前/记忆/历史对话，不要把 memory_read 作为概念讲解问题的根分支或终止依据。\n\n"
                         f"用户问题：{request.user_query}\n\n"
                         f"项目上下文预览：\n{context.packed_context[:2200]}\n\n"
                         f"当前路径历史：\n{agent_history_text(history)}\n\n"
@@ -2276,6 +3142,15 @@ def lats_candidate_actions(
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("llm_lats_candidate_actions_failed error=%s", exc)
     candidates.extend(fallback_lats_candidate_actions(request, history, limit=limit))
+    if is_concept_overview_query(request.user_query) and not is_memory_intent_query(request.user_query):
+        adjusted: list[tuple[AgentDecision, float]] = []
+        for decision, prior in candidates:
+            if decision.action == "memory_read":
+                continue
+            if not history and decision.action == "final_answer":
+                continue
+            adjusted.append((decision, prior))
+        candidates = adjusted
     return dedupe_lats_candidates(candidates, limit=limit)
 
 
@@ -2464,6 +3339,8 @@ def llm_lats_evaluate_node(request: TurnScopedRequest, node: LatsAgentNode) -> t
                         '{"score": 0.0, "terminal": false, "reflection": "简短反思"}\n\n'
                         "评分要求：0 表示无用或失败，1 表示可以可靠回答。"
                         "不要因为工具名本身打高分，要看 observation 是否回答了用户问题。\n\n"
+                        "对“讲一讲/介绍/概述/是什么”等概念讲解问题，纯 memory_read 分支不能视为可靠终止；"
+                        "应优先奖励 RAG/公开资料证据加最终综合。\n\n"
                         f"用户问题：{request.user_query}\n\n"
                         f"当前路径：\n{agent_history_text(node.history)}"
                     ),
@@ -2482,13 +3359,42 @@ def llm_lats_evaluate_node(request: TurnScopedRequest, node: LatsAgentNode) -> t
     return score, terminal, reflection
 
 
+def adjust_lats_evaluation(
+    request: TurnScopedRequest,
+    node: LatsAgentNode,
+    score: float,
+    terminal: bool,
+    reflection: str,
+) -> tuple[float, bool, str]:
+    if (
+        node.decision
+        and is_concept_overview_query(request.user_query)
+        and not is_memory_intent_query(request.user_query)
+    ):
+        if node.decision.action == "memory_read":
+            return (
+                min(score, 0.35),
+                False,
+                compact_text(f"{reflection} 概念讲解不能只依赖项目记忆，需要检索资料或最终综合。", 300),
+            )
+        if node.decision.action == "final_answer" and not node.evidence_items and len(lats_history_actions(node.history)) <= 1:
+            return (
+                min(score, 0.35),
+                terminal,
+                compact_text(f"{reflection} 根节点直接回答缺少资料支撑，降权。", 300),
+            )
+    return score, terminal, reflection
+
+
 def lats_evaluate_node(request: TurnScopedRequest, node: LatsAgentNode) -> tuple[float, bool, str]:
     if llm_available():
         try:
-            return llm_lats_evaluate_node(request, node)
+            score, terminal, reflection = llm_lats_evaluate_node(request, node)
+            return adjust_lats_evaluation(request, node, score, terminal, reflection)
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("llm_lats_evaluate_node_failed error=%s", exc)
-    return heuristic_lats_evaluation(request, node)
+    score, terminal, reflection = heuristic_lats_evaluation(request, node)
+    return adjust_lats_evaluation(request, node, score, terminal, reflection)
 
 
 def best_lats_node(root: LatsAgentNode) -> LatsAgentNode:
@@ -2509,6 +3415,61 @@ def lats_search_queries_from_history(history: list[dict[str, object]]) -> list[s
             if query:
                 queries.append(query)
     return dedupe_preserve_order(queries)
+
+
+def lats_node_tree_payload(
+    node: LatsAgentNode,
+    *,
+    best_path_ids: set[str],
+) -> dict[str, object]:
+    decision = node.decision
+    observation = node.observation
+    return {
+        "id": node.node_id,
+        "parent_id": node.parent.node_id if node.parent else "",
+        "depth": node.depth,
+        "action": decision.action if decision else "root",
+        "skill": agent_tool_registry().get(decision.action).skill if decision and decision.action in agent_tool_registry() else "",
+        "thought": decision.thought if decision else "LATS root",
+        "arguments": decision.arguments if decision else {},
+        "observation_tool": observation.tool_name if observation else "",
+        "observation_summary": observation.summary if observation else "",
+        "score": round(node.score, 4),
+        "visits": node.visits,
+        "value_sum": round(node.value_sum, 4),
+        "average_value": round(lats_node_average(node), 4),
+        "prior": round(node.prior, 4),
+        "terminal": node.terminal,
+        "best_path": node.node_id in best_path_ids,
+        "reflection": node.reflection,
+        "evidence_labels": [item.label for item in node.evidence_items],
+        "children": [
+            lats_node_tree_payload(child, best_path_ids=best_path_ids)
+            for child in sorted(node.children, key=lambda child: (child.depth, child.node_id))
+        ],
+    }
+
+
+def lats_trace_tree_payload(
+    root: LatsAgentNode,
+    best_node: LatsAgentNode,
+    *,
+    iterations: int,
+    expanded_count: int,
+) -> dict[str, object]:
+    best_path = lats_path(best_node)
+    best_path_ids = {node.node_id for node in best_path}
+    return {
+        "kind": "lats_agent_mcts",
+        "root_id": root.node_id,
+        "best_node_id": best_node.node_id,
+        "best_path": [node.node_id for node in best_path],
+        "best_actions": [node.decision.action for node in best_path if node.decision is not None],
+        "iterations": iterations,
+        "expanded_count": expanded_count,
+        "node_count": len(lats_all_nodes(root)),
+        "root": lats_node_tree_payload(root, best_path_ids=best_path_ids),
+    }
 
 
 def execute_lats_agent_plan(
@@ -2651,6 +3612,12 @@ def execute_lats_agent_plan(
     final_evidence = best_node.evidence_items
     best_path = lats_path(best_node)
     path_actions = [node.decision.action for node in best_path if node.decision is not None]
+    trace_tree = lats_trace_tree_payload(
+        root,
+        best_node,
+        iterations=iterations,
+        expanded_count=expanded_count,
+    )
     append_step(
         PlanExecutionStep(
             step_id="lats-final-select",
@@ -2669,7 +3636,26 @@ def execute_lats_agent_plan(
     final_text = ""
     if best_node.decision and best_node.decision.action == "final_answer":
         final_text = str(best_node.decision.arguments.get("answer") or "")
-    answer_text = agent_final_answer_from_history(request, best_node.history, final_text, final_evidence)
+    if final_text.strip():
+        answer_text = final_text.strip()
+    else:
+        answer_text, synthesized = synthesize_agent_answer(
+            request,
+            mode="lats_agent_mcts",
+            final_text="",
+            history=best_node.history,
+            evidence_items=final_evidence,
+        )
+        append_step(
+            PlanExecutionStep(
+                step_id="lats-final-synthesis",
+                task_id="task-4",
+                title="LATS final synthesis" if synthesized else "LATS final fallback",
+                action="lats_final",
+                summary=compact_text(answer_text, 260),
+                evidence_labels=[item.label for item in final_evidence],
+            )
+        )
     direct_fallback_used = False
     if agent_should_use_direct_llm_fallback(answer_text, best_node.history, final_evidence):
         fallback = try_direct_llm_answer(
@@ -2717,6 +3703,7 @@ def execute_lats_agent_plan(
             "replan_count": expanded_count,
             "replan_reason": "MCTS 通过 selection/expansion/evaluation/backpropagation 反复重估工具路径。",
             "search_queries": dedupe_preserve_order([request.user_query, *lats_search_queries_from_history(best_node.history)]),
+            "trace_tree": trace_tree,
         }
     )
     return plan, retrieval, answer
@@ -3235,6 +4222,7 @@ def run_research(db: Session, request: TurnScopedRequest) -> RunResearchResponse
         ),
         todo=todo,
     )
+    answer = attach_answer_quality(plan, retrieval, answer, memory)
     trace_id = f"trace-{uuid.uuid4().hex[:12]}"
     persist_research_run(
         db,
@@ -3294,6 +4282,7 @@ def run_agent_research(db: Session, request: TurnScopedRequest) -> RunResearchRe
         ),
         todo=todo,
     )
+    answer = attach_answer_quality(plan, retrieval, answer, memory)
     trace_id = f"trace-{uuid.uuid4().hex[:12]}"
     persist_research_run(
         db,
@@ -3353,6 +4342,7 @@ def run_lats_research(db: Session, request: TurnScopedRequest) -> RunResearchRes
         ),
         todo=todo,
     )
+    answer = attach_answer_quality(plan, retrieval, answer, memory)
     trace_id = f"trace-{uuid.uuid4().hex[:12]}"
     persist_research_run(
         db,
@@ -3428,6 +4418,8 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
             ),
             todo=todo,
         )
+        answer = attach_answer_quality(plan, retrieval, answer, memory)
+        yield {"type": "answer_quality", "quality": answer.quality.model_dump(mode="json")}
         trace_id = f"trace-{uuid.uuid4().hex[:12]}"
         run = persist_research_run(
             db,
@@ -3507,6 +4499,8 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
         ),
         todo=todo,
     )
+    answer = attach_answer_quality(plan, retrieval, answer, memory)
+    yield {"type": "answer_quality", "quality": answer.quality.model_dump(mode="json")}
     trace_id = f"trace-{uuid.uuid4().hex[:12]}"
     run = persist_research_run(
         db,
@@ -3540,6 +4534,8 @@ def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dic
     plan, retrieval, answer = execute_agent_plan(db, request, context, on_step=trace_events.append)
     for step in trace_events:
         yield {"type": "trace", "step": step.model_dump(mode="json")}
+    if plan.trace_tree:
+        yield {"type": "trace_tree", "trace_tree": plan.trace_tree}
     yield {
         "type": "solver_summary",
         "solver_summary": plan.solver_summary,
@@ -3561,6 +4557,8 @@ def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dic
         ),
         todo=todo,
     )
+    answer = attach_answer_quality(plan, retrieval, answer, memory)
+    yield {"type": "answer_quality", "quality": answer.quality.model_dump(mode="json")}
     trace_id = f"trace-{uuid.uuid4().hex[:12]}"
     run = persist_research_run(
         db,
@@ -3596,6 +4594,8 @@ def stream_lats_events(db: Session, request: TurnScopedRequest) -> Iterator[dict
     )
     for step in trace_events:
         yield {"type": "trace", "step": step.model_dump(mode="json")}
+    if plan.trace_tree:
+        yield {"type": "trace_tree", "trace_tree": plan.trace_tree}
     yield {
         "type": "solver_summary",
         "solver_summary": plan.solver_summary,
@@ -3617,6 +4617,8 @@ def stream_lats_events(db: Session, request: TurnScopedRequest) -> Iterator[dict
         ),
         todo=todo,
     )
+    answer = attach_answer_quality(plan, retrieval, answer, memory)
+    yield {"type": "answer_quality", "quality": answer.quality.model_dump(mode="json")}
     trace_id = f"trace-{uuid.uuid4().hex[:12]}"
     run = persist_research_run(
         db,

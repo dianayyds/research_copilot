@@ -418,6 +418,99 @@ button {
   line-height: 1.7;
 }
 
+.trace-tree {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.trace-tree-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.trace-tree-header span,
+.trace-tree-path {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trace-tree-list {
+  display: grid;
+  gap: 6px;
+}
+
+.trace-tree-node {
+  margin-left: calc(var(--tree-depth) * 16px);
+  border-left: 2px solid var(--line);
+  padding: 7px 8px 7px 10px;
+  background: #fafafa;
+  border-radius: 6px;
+  min-width: 0;
+}
+
+.trace-tree-node.best-path {
+  border-left-color: #111111;
+  background: #f3f4f6;
+}
+
+.trace-tree-node.terminal-node {
+  outline: 1px solid #d1d5db;
+}
+
+.trace-tree-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.trace-tree-action,
+.trace-tree-skill,
+.trace-tree-metric,
+.trace-tree-best {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 11px;
+  line-height: 1.4;
+  background: #ffffff;
+  color: var(--muted);
+}
+
+.trace-tree-action {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.trace-tree-best {
+  background: #111111;
+  color: #ffffff;
+  border-color: #111111;
+}
+
+.trace-tree-detail {
+  display: grid;
+  gap: 4px;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.trace-tree-detail code {
+  color: var(--text);
+  font-size: 11px;
+  white-space: normal;
+}
+
 .trace-list {
   display: grid;
   gap: 10px;
@@ -461,6 +554,46 @@ button {
   line-height: 1.9;
   color: var(--text);
   word-break: break-word;
+}
+
+.assistant-body p {
+  margin: 0 0 14px;
+}
+
+.assistant-body p:last-child,
+.assistant-body ul:last-child {
+  margin-bottom: 0;
+}
+
+.assistant-body h3,
+.assistant-body h4,
+.assistant-body h5,
+.assistant-body h6 {
+  margin: 18px 0 8px;
+  font-size: 17px;
+  line-height: 1.5;
+}
+
+.assistant-body ul {
+  margin: 0 0 16px;
+  padding-left: 1.25em;
+}
+
+.assistant-body li {
+  margin: 5px 0;
+}
+
+.assistant-body strong {
+  font-weight: 700;
+}
+
+.assistant-body code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
 }
 
 .stream-caret {
@@ -655,6 +788,13 @@ button {
 
 .asset-form {
   flex: 0 0 auto;
+}
+
+.upload-progress {
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .field {

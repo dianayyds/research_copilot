@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import hashlib
 import json
 import os
 
@@ -15,8 +16,9 @@ os.environ["LLM_API_KEY"] = ""
 
 from app.db import Base, engine  # noqa: E402
 from app.live_tools import LiveToolEvidence, LiveToolResult, LiveToolRoute  # noqa: E402
+from app.memory_manager import MemoryContextBundle  # noqa: E402
 from app.main import app  # noqa: E402
-from app.services import AgentDecision  # noqa: E402
+from app.services import AgentDecision, focused_memory_observation_text  # noqa: E402
 from app.semantic_store import get_semantic_memory_store, reset_semantic_memory_store  # noqa: E402
 from app.vector_store import get_vector_store, reset_vector_store  # noqa: E402
 
@@ -80,6 +82,45 @@ def make_pdf_bytes(text: str) -> bytes:
     return buffer.getvalue()
 
 
+class FakeUploadProgressStore:
+    def __init__(self) -> None:
+        self.metas: dict[str, dict[str, str]] = {}
+        self.chunks: dict[str, set[int]] = {}
+
+    def save_meta(self, upload_id: str, meta: dict[str, object]) -> None:
+        current = self.metas.setdefault(upload_id, {})
+        current.update({key: str(value) for key, value in meta.items() if value is not None})
+
+    def get_meta(self, upload_id: str) -> dict[str, str]:
+        return dict(self.metas.get(upload_id, {}))
+
+    def mark_chunk_uploaded(self, upload_id: str, chunk_index: int) -> None:
+        self.chunks.setdefault(upload_id, set()).add(chunk_index)
+
+    def uploaded_chunks(self, upload_id: str, total_chunks: int) -> list[int]:
+        return [index for index in range(total_chunks) if index in self.chunks.get(upload_id, set())]
+
+
+class FakeChunkStorage:
+    def __init__(self) -> None:
+        self.chunks: dict[tuple[str, int], bytes] = {}
+        self.objects: dict[str, bytes] = {}
+
+    def put_chunk(self, upload_id: str, chunk_index: int, data: bytes, content_type: str) -> str:
+        self.chunks[(upload_id, chunk_index)] = data
+        return f"{upload_id}/{chunk_index}"
+
+    def final_object_key(self, upload_id: str, filename: str) -> str:
+        return f"{upload_id}/final/{filename}"
+
+    def compose_chunks(self, upload_id: str, total_chunks: int, final_object_key: str) -> str:
+        self.objects[final_object_key] = b"".join(self.chunks[(upload_id, index)] for index in range(total_chunks))
+        return final_object_key
+
+    def read_object(self, object_key: str) -> bytes:
+        return self.objects[object_key]
+
+
 async def test_root_page_serves_workspace() -> None:
     reset_db()
     async with app.router.lifespan_context(app):
@@ -89,7 +130,57 @@ async def test_root_page_serves_workspace() -> None:
     assert "Research Copilot" in response.text
     assert "新对话" in response.text
     assert "资产" in response.text
-    assert "LATS" in response.text
+    assert "Plan-and-Solve Agent" in response.text
+    assert "LATS Agent" in response.text
+
+
+async def test_skill_registry_lists_research_skills_and_tools() -> None:
+    reset_db()
+    async with app.router.lifespan_context(app):
+        async with make_client() as client:
+            response = await client.get("/api/v1/skills")
+
+    assert response.status_code == 200
+    payload = response.json()
+    skill_names = {skill["name"] for skill in payload["skills"]}
+    tool_by_name = {tool["name"]: tool for tool in payload["tools"]}
+    assert len(skill_names) >= 8
+    assert {
+        "project_literature_rag",
+        "public_literature_lookup",
+        "research_memory",
+        "asset_inventory",
+        "quantitative_check",
+    } <= skill_names
+    assert tool_by_name["local_rag_search"]["skill"] == "project_literature_rag"
+    assert tool_by_name["local_rag_search"]["read_only"] is True
+    assert tool_by_name["calculator"]["intent"] == "calculation"
+    assert tool_by_name["todo_create"]["read_only"] is False
+    assert tool_by_name["todo_create"]["risk_level"] == "medium"
+
+
+async def test_memory_read_focuses_on_query_relevant_snippets() -> None:
+    bundle = MemoryContextBundle(
+        working_lines=[
+            "- turn_19_query: 特朗普今年多大？",
+            "- turn_20_answer: 万斯今年 41 岁。",
+        ],
+        episodic_lines=[
+            "- [research_run] 讲解一下语义通信 -> 语义通信关注含义传输和任务效果。",
+            "- [research_run] 介绍 LATS -> LATS 是一种 Agent 搜索框架。",
+        ],
+        semantic_lines=[
+            "- fact.semantic_comm: 语义通信通过语义编码减少冗余比特。",
+        ],
+    )
+
+    text, count = focused_memory_observation_text(bundle, "讲一讲语义通信")
+
+    assert count >= 2
+    assert "语义通信" in text
+    assert "特朗普" not in text
+    assert "万斯" not in text
+    assert "LATS" not in text
 
 
 async def test_project_session_chat_flow_with_global_assets() -> None:
@@ -154,6 +245,10 @@ async def test_project_session_chat_flow_with_global_assets() -> None:
     assert first_payload["retrieval"]["evidence_items"][0]["asset_id"] == asset["id"]
     assert first_payload["retrieval"]["retrieval_mode"] == "stub_plan_hybrid_rerank"
     assert first_payload["answer"]["citations"]
+    assert first_payload["answer"]["quality"]["evidence_count"] == len(first_payload["retrieval"]["evidence_items"])
+    assert first_payload["answer"]["quality"]["citation_count"] == len(first_payload["answer"]["citations"])
+    assert first_payload["answer"]["quality"]["grounded"] is True
+    assert first_payload["answer"]["quality"]["next_actions"]
 
     assert second.status_code == 200
     second_payload = second.json()
@@ -390,6 +485,83 @@ async def test_pdf_file_upload_extracts_page_text() -> None:
     assert "Plan Solve PDF" in payload["content"]
 
 
+async def test_resumable_chunk_upload_resumes_and_finalizes_asset(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_db()
+    fake_store = FakeUploadProgressStore()
+    fake_storage = FakeChunkStorage()
+    monkeypatch.setattr("app.services.get_upload_progress_store", lambda: fake_store)
+    monkeypatch.setattr("app.services.get_chunk_storage", lambda: fake_storage)
+    monkeypatch.setattr("app.services.settings.resumable_upload_chunk_size", 8)
+    content = b"chunked upload note text"
+    file_md5 = hashlib.md5(content).hexdigest()
+    async with app.router.lifespan_context(app):
+        async with make_client() as client:
+            init = await client.post(
+                "/api/v1/assets/uploads/init",
+                json={
+                    "filename": "chunked.txt",
+                    "file_size": len(content),
+                    "file_md5": file_md5,
+                    "chunk_size": 8,
+                    "title": "Chunked Note",
+                    "asset_type": "note",
+                },
+            )
+            upload_first = await client.post(
+                f"/api/v1/assets/uploads/{file_md5}/chunks",
+                data={"chunk_index": "0"},
+                files={"chunk": ("chunk-0", content[:8], "application/octet-stream")},
+            )
+            upload_last = await client.post(
+                f"/api/v1/assets/uploads/{file_md5}/chunks",
+                data={"chunk_index": "2"},
+                files={"chunk": ("chunk-2", content[16:], "application/octet-stream")},
+            )
+            resumed = await client.post(
+                "/api/v1/assets/uploads/init",
+                json={
+                    "filename": "chunked.txt",
+                    "file_size": len(content),
+                    "file_md5": file_md5,
+                    "chunk_size": 8,
+                    "title": "Chunked Note",
+                    "asset_type": "note",
+                },
+            )
+            upload_missing = await client.post(
+                f"/api/v1/assets/uploads/{file_md5}/chunks",
+                data={"chunk_index": "1"},
+                files={"chunk": ("chunk-1", content[8:16], "application/octet-stream")},
+            )
+            complete = await client.post(
+                f"/api/v1/assets/uploads/{file_md5}/complete",
+                json={"title": "Chunked Note", "asset_type": "note"},
+            )
+            duplicate = await client.post(
+                "/api/v1/assets/uploads/init",
+                json={
+                    "filename": "chunked.txt",
+                    "file_size": len(content),
+                    "file_md5": file_md5,
+                    "chunk_size": 8,
+                },
+            )
+
+    assert init.status_code == 200
+    assert init.json()["total_chunks"] == 3
+    assert upload_first.json()["missing_chunks"] == [1, 2]
+    assert upload_last.json()["missing_chunks"] == [1]
+    assert resumed.json()["missing_chunks"] == [1]
+    assert upload_missing.json()["complete"] is True
+    assert complete.status_code == 200
+    completed_payload = complete.json()
+    assert completed_payload["finalized"] is True
+    assert completed_payload["asset"]["title"] == "Chunked Note"
+    assert "chunked upload note text" in completed_payload["asset"]["content"]
+    assert duplicate.json()["finalized"] is True
+    assert duplicate.json()["asset"]["id"] == completed_payload["asset"]["id"]
+
+
 async def test_solver_replans_when_initial_evidence_is_weak() -> None:
     reset_db()
     async with app.router.lifespan_context(app):
@@ -441,6 +613,9 @@ async def test_local_no_evidence_uses_direct_llm_fallback(monkeypatch: pytest.Mo
     payload = response.json()
     assert payload["retrieval"]["evidence_items"] == []
     assert "79 岁" in payload["answer"]["answer"]
+    assert payload["answer"]["quality"]["evidence_count"] == 0
+    assert payload["answer"]["quality"]["grounded"] is False
+    assert "no_retrieved_evidence" in payload["answer"]["quality"]["gaps"]
     assert "当前知识库" not in payload["answer"]["answer"]
     assert "网络搜索" not in payload["answer"]["answer"]
 
@@ -1043,6 +1218,11 @@ async def test_lats_agent_mcts_selects_calculator_path(monkeypatch: pytest.Monke
     assert payload["plan"]["planner_mode"] == "lats_agent_mcts"
     assert payload["retrieval"]["retrieval_mode"] == "lats_agent_mcts"
     assert "84" in payload["answer"]["answer"]
+    tree = payload["plan"]["trace_tree"]
+    assert tree["kind"] == "lats_agent_mcts"
+    assert tree["best_actions"] == ["calculator"]
+    assert tree["root"]["children"]
+    assert any(child["action"] == "calculator" and child["skill"] == "quantitative_check" for child in tree["root"]["children"])
     actions = [step["action"] for step in payload["plan"]["execution_trace"]]
     assert "lats_select" in actions
     assert "lats_expand" in actions
@@ -1098,10 +1278,79 @@ async def test_lats_agent_mcts_recovers_from_failed_public_search(monkeypatch: p
     assert payload["plan"]["planner_mode"] == "lats_agent_mcts"
     assert payload["retrieval"]["evidence_items"][0]["asset_id"] == asset["id"]
     assert "function calling" in payload["answer"]["answer"].lower()
+    assert "local_rag_search" in payload["plan"]["trace_tree"]["best_actions"]
     trace = payload["plan"]["execution_trace"]
     assert any(step["action"] == "lats_observation" and step["status"] == "failed" for step in trace)
     assert any(step["action"] == "lats_action" and "local_rag_search" in step["summary"] for step in trace)
     assert any(step["action"] == "lats_final" for step in trace)
+
+
+async def test_lats_concept_overview_prefers_rag_over_memory_dump(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_db()
+    monkeypatch.setattr("app.services.settings.llm_provider", "deepseek")
+    monkeypatch.setattr("app.services.settings.llm_api_key", "test-key")
+    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
+    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
+    monkeypatch.setattr("app.services.settings.lats_iterations", 1)
+
+    def fake_llm_lats_candidate_actions(request, context, history, *, limit: int):
+        return [
+            (AgentDecision("记忆里可能有旧回答。", "memory_read", {"query": "语义通信"}), 0.99),
+            (
+                AgentDecision(
+                    "检索项目资料。",
+                    "local_rag_search",
+                    {"query": "语义通信 定义 原理 应用"},
+                ),
+                0.5,
+            ),
+        ][:limit]
+
+    def fake_llm_lats_evaluate_node(request, node):
+        if node.decision and node.decision.action == "memory_read":
+            return 1.0, True, "错误地把记忆当作完整答案。"
+        if node.decision and node.decision.action == "local_rag_search":
+            return 0.72, False, "RAG 证据可用于概念综合。"
+        return 0.2, False, "弱分支。"
+
+    def fake_llm_agent_synthesize_answer(request, *, mode, final_text, history, evidence_items):
+        assert mode == "lats_agent_mcts"
+        assert evidence_items
+        return "语义通信是一种面向含义和任务目标的通信范式，可结合语义编码减少冗余传输。"
+
+    monkeypatch.setattr("app.services.llm_lats_candidate_actions", fake_llm_lats_candidate_actions)
+    monkeypatch.setattr("app.services.llm_lats_evaluate_node", fake_llm_lats_evaluate_node)
+    monkeypatch.setattr("app.services.llm_agent_synthesize_answer", fake_llm_agent_synthesize_answer)
+
+    async with app.router.lifespan_context(app):
+        async with make_client() as client:
+            project = await create_project(client, "LATS Concept Project")
+            session = await create_session(client, project["id"])
+            await client.post(
+                "/api/v1/assets",
+                json={
+                    "title": "语义通信笔记",
+                    "asset_type": "note",
+                    "content": "语义通信关注信息含义、任务目标和语义编码，可减少冗余比特传输。",
+                },
+            )
+            response = await client.post(
+                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run",
+                json={
+                    "user_query": "讲一讲语义通信",
+                    "sequence_id": 1,
+                    "asset_ids": [],
+                },
+            )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["retrieval"]["evidence_items"]
+    assert payload["plan"]["trace_tree"]["best_actions"] == ["local_rag_search"]
+    assert all(child["action"] != "memory_read" for child in payload["plan"]["trace_tree"]["root"]["children"])
+    assert "语义通信" in payload["answer"]["answer"]
+    assert "特朗普" not in payload["answer"]["answer"]
+    assert any(step["title"] == "LATS final synthesis" for step in payload["plan"]["execution_trace"])
 
 
 async def test_lats_stream_emits_mcts_trace_events(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1131,6 +1380,7 @@ async def test_lats_stream_emits_mcts_trace_events(monkeypatch: pytest.MonkeyPat
     event_types = [event["type"] for event in events]
     assert "plan" in event_types
     assert "trace" in event_types
+    assert "trace_tree" in event_types
     assert "answer_delta" in event_types
     assert event_types[-1] == "complete"
     trace_actions = [event["step"]["action"] for event in events if event["type"] == "trace"]
@@ -1139,6 +1389,8 @@ async def test_lats_stream_emits_mcts_trace_events(monkeypatch: pytest.MonkeyPat
     assert "lats_evaluate" in trace_actions
     assert "lats_backprop" in trace_actions
     assert events[-1]["run"]["plan"]["planner_mode"] == "lats_agent_mcts"
+    tree_event = next(event for event in events if event["type"] == "trace_tree")
+    assert tree_event["trace_tree"]["best_actions"] == ["calculator"]
     assert "56" in events[-1]["run"]["answer"]["answer"]
 
 
@@ -1216,6 +1468,8 @@ async def test_stream_run_emits_plan_trace_and_complete_events() -> None:
     assert "plan" in event_types
     assert "trace" in event_types
     assert "answer_delta" in event_types
+    assert "answer_quality" in event_types
     assert event_types[-1] == "complete"
     complete_event = events[-1]
     assert complete_event["run"]["plan"]["planner_mode"] == "two_stage"
+    assert complete_event["run"]["answer"]["quality"]["grounded"] is True

@@ -88,6 +88,35 @@ class AssetResponse(AssetBase):
     updated_at: datetime
 
 
+class ResumableUploadInitRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=255)
+    file_size: int = Field(..., ge=1)
+    file_md5: str = Field(..., min_length=32, max_length=32)
+    chunk_size: int = Field(..., ge=1)
+    title: str | None = Field(default=None, max_length=120)
+    asset_type: str | None = None
+
+
+class ResumableUploadCompleteRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    asset_type: str | None = None
+
+
+class ResumableUploadStatusResponse(BaseModel):
+    upload_id: str
+    file_md5: str
+    filename: str
+    file_size: int
+    chunk_size: int
+    total_chunks: int
+    uploaded_chunks: list[int] = Field(default_factory=list)
+    missing_chunks: list[int] = Field(default_factory=list)
+    uploaded_count: int = 0
+    complete: bool = False
+    finalized: bool = False
+    asset: AssetResponse | None = None
+
+
 class TodoBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=160)
     description: str = ""
@@ -188,6 +217,7 @@ class PlanTasksResponse(BaseModel):
     solver_summary: str = ""
     replan_count: int = 0
     replan_reason: str = ""
+    trace_tree: dict[str, Any] = Field(default_factory=dict)
     generated_at: str = Field(default_factory=utc_now)
 
 
@@ -226,12 +256,26 @@ class Citation(BaseModel):
     score: float
 
 
+class AnswerQualityReport(BaseModel):
+    score: float = Field(default=0.0, ge=0.0, le=5.0)
+    level: str = "unknown"
+    evidence_count: int = 0
+    citation_count: int = 0
+    answer_length: int = 0
+    grounded: bool = False
+    fallback_used: bool = False
+    signals: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+
+
 class AnswerResponse(BaseModel):
     project_id: str
     session_id: str
     sequence_id: int
     answer: str
     citations: list[Citation]
+    quality: AnswerQualityReport = Field(default_factory=AnswerQualityReport)
     generated_at: str = Field(default_factory=utc_now)
 
 

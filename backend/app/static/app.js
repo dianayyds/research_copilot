@@ -10,7 +10,6 @@ const state = {
   streamingRun: null,
   assets: [],
   assetDrawerOpen: false,
-  agentMode: false,
   latsMode: false,
 };
 
@@ -21,7 +20,7 @@ const sequenceHintEl = document.getElementById("sequence-hint");
 const composerForm = document.getElementById("composer-form");
 const composerQueryEl = document.getElementById("composer-query");
 const composerSubmitEl = document.getElementById("composer-submit");
-const agentModeToggleEl = document.getElementById("agent-mode-toggle");
+const planSolveModeToggleEl = document.getElementById("plan-solve-mode-toggle");
 const latsModeToggleEl = document.getElementById("lats-mode-toggle");
 const newSessionButton = document.getElementById("new-session-button");
 const assetToggleButton = document.getElementById("asset-toggle-button");
@@ -63,6 +62,82 @@ function renderText(value) {
   return escapeHtml(value).replaceAll("\n", "<br />");
 }
 
+function renderMarkdownInline(value) {
+  const codeSpans = [];
+  let html = escapeHtml(value);
+  html = html.replace(/`([^`]+)`/g, (_, code) => {
+    const index = codeSpans.length;
+    codeSpans.push(`<code>${code}</code>`);
+    return `@@CODE_SPAN_${index}@@`;
+  });
+  html = html.replace(/\*\*([\s\S]+?)\*\*/g, (_, content) => `<strong>${content.trim()}</strong>`);
+  html = html.replace(/__([\s\S]+?)__/g, (_, content) => `<strong>${content.trim()}</strong>`);
+  html = html.replace(/@@CODE_SPAN_(\d+)@@/g, (_, index) => codeSpans[Number(index)] || "");
+  return html;
+}
+
+function renderMarkdown(value) {
+  const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  let paragraph = [];
+  let listItems = [];
+
+  const flushParagraph = () => {
+    if (!paragraph.length) {
+      return;
+    }
+    blocks.push(`<p>${paragraph.map(renderMarkdownInline).join("<br />")}</p>`);
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!listItems.length) {
+      return;
+    }
+    blocks.push(`<ul>${listItems.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</ul>`);
+    listItems = [];
+  };
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      return;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      flushParagraph();
+      flushList();
+      const level = Math.min(headingMatch[1].length + 2, 6);
+      blocks.push(`<h${level}>${renderMarkdownInline(headingMatch[2])}</h${level}>`);
+      return;
+    }
+
+    const bulletMatch = trimmed.match(/^[-*]\s+(.+)$/);
+    if (bulletMatch) {
+      flushParagraph();
+      listItems.push(bulletMatch[1]);
+      return;
+    }
+
+    const numberedMatch = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    if (numberedMatch) {
+      flushParagraph();
+      listItems.push(numberedMatch[1]);
+      return;
+    }
+
+    flushList();
+    paragraph.push(trimmed);
+  });
+
+  flushParagraph();
+  flushList();
+  return blocks.join("");
+}
+
 function formatTime(value) {
   const date = new Date(value);
   return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(
@@ -86,23 +161,23 @@ function nextSequenceId() {
 
 function runModeLabel() {
   if (state.latsMode) {
-    return "LATS";
+    return "LATS Agent";
   }
-  return state.agentMode ? "Agent" : "Research";
+  return "Plan-and-Solve Agent";
 }
 
 function plannerModeForStreamingRun() {
   if (state.latsMode) {
     return "lats_agent_mcts";
   }
-  return state.agentMode ? "agent_loop" : "two_stage";
+  return "two_stage";
 }
 
 function runPathForMode() {
   if (state.latsMode) {
     return "lats/run/stream";
   }
-  return state.agentMode ? "agent/run/stream" : "run/stream";
+  return "run/stream";
 }
 
 function resetAssetForm() {
@@ -126,7 +201,7 @@ function adjustComposerHeight() {
 function setSubmitting(isSubmitting) {
   composerQueryEl.disabled = isSubmitting;
   composerSubmitEl.disabled = isSubmitting;
-  agentModeToggleEl.disabled = isSubmitting;
+  planSolveModeToggleEl.disabled = isSubmitting;
   latsModeToggleEl.disabled = isSubmitting;
   composerSubmitEl.innerHTML = `<span>${isSubmitting ? "…" : "↑"}</span>`;
 }
@@ -147,7 +222,7 @@ function renderHeader() {
   const session = selectedSession();
   chatTitleEl.textContent = session ? session.title : "新对话";
   sequenceHintEl.textContent = `${runModeLabel()} · 下一轮 #${nextSequenceId()}`;
-  agentModeToggleEl.checked = state.agentMode;
+  planSolveModeToggleEl.checked = !state.latsMode;
   latsModeToggleEl.checked = state.latsMode;
 }
 
@@ -229,6 +304,55 @@ function renderCitations(citations) {
   `;
 }
 
+function formatScore(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(2) : "0.00";
+}
+
+function renderTraceTreeNode(node) {
+  const children = node.children || [];
+  const depth = Math.max(0, Number(node.depth) || 0);
+  const action = node.action || "root";
+  const skill = node.skill || "";
+  const summary = node.observation_summary || node.reflection || node.thought || "";
+  const args = node.arguments && Object.keys(node.arguments).length ? JSON.stringify(node.arguments) : "";
+  return `
+    <div class="trace-tree-node ${node.best_path ? "best-path" : ""} ${node.terminal ? "terminal-node" : ""}" style="--tree-depth: ${depth}">
+      <div class="trace-tree-main">
+        <span class="trace-tree-action">${escapeHtml(action)}</span>
+        ${skill ? `<span class="trace-tree-skill">${escapeHtml(skill)}</span>` : ""}
+        <span class="trace-tree-metric">score ${formatScore(node.score)}</span>
+        <span class="trace-tree-metric">visits ${escapeHtml(node.visits || 0)}</span>
+        ${node.best_path ? '<span class="trace-tree-best">best</span>' : ""}
+      </div>
+      <div class="trace-tree-detail">
+        ${summary ? `<span>${escapeHtml(summary)}</span>` : ""}
+        ${args ? `<code>${escapeHtml(args)}</code>` : ""}
+      </div>
+    </div>
+    ${children.map((child) => renderTraceTreeNode(child)).join("")}
+  `;
+}
+
+function renderTraceTree(traceTree) {
+  if (!traceTree || !traceTree.root) {
+    return "";
+  }
+  const bestActions = traceTree.best_actions?.length ? traceTree.best_actions.join(" → ") : "未选择";
+  return `
+    <div class="trace-tree">
+      <div class="trace-tree-header">
+        <strong>Agent 搜索树</strong>
+        <span>${escapeHtml(traceTree.iterations || 0)} iter · ${escapeHtml(traceTree.node_count || 0)} nodes</span>
+      </div>
+      <div class="trace-tree-path">best path: ${escapeHtml(bestActions)}</div>
+      <div class="trace-tree-list">
+        ${renderTraceTreeNode(traceTree.root)}
+      </div>
+    </div>
+  `;
+}
+
 function renderExecutionTrace(run) {
   const plan = run.plan || {};
   const steps = plan.execution_trace || [];
@@ -245,6 +369,7 @@ function renderExecutionTrace(run) {
         <div class="thinking-state">${escapeHtml(replanLabel)}</div>
       </div>
       <div class="thinking-plan">${escapeHtml(planSummary || "正在规划执行路径…")}</div>
+      ${renderTraceTree(plan.trace_tree)}
       ${
         steps.length
           ? `
@@ -294,7 +419,7 @@ function renderChat() {
             <div class="assistant-block">
               ${renderExecutionTrace(run)}
               <div class="assistant-body">
-                ${renderText(run.answer?.answer || (run.status === "streaming" ? "正在整理答案…" : ""))}
+                ${renderMarkdown(run.answer?.answer || (run.status === "streaming" ? "正在整理答案…" : ""))}
                 ${run.status === "streaming" ? '<span class="stream-caret"></span>' : ""}
               </div>
               ${renderCitations(run.answer?.citations || [])}
@@ -435,6 +560,7 @@ function createStreamingRun(query, sessionId, sequenceId) {
       plan_summary: "",
       tasks: [],
       execution_trace: [],
+      trace_tree: {},
       solver_summary: "",
       replan_count: 0,
       replan_reason: "",
@@ -512,6 +638,9 @@ async function runTurn(query) {
       if (event.type === "trace" && event.step) {
         state.streamingRun.plan.execution_trace = [...state.streamingRun.plan.execution_trace, event.step];
       }
+      if (event.type === "trace_tree" && event.trace_tree) {
+        state.streamingRun.plan.trace_tree = event.trace_tree;
+      }
       if (event.type === "solver_summary") {
         state.streamingRun.plan.solver_summary = event.solver_summary || "";
         state.streamingRun.plan.replan_count = event.replan_count || 0;
@@ -548,19 +677,13 @@ assetToggleButton.addEventListener("click", () => {
   toggleAssetDrawer();
 });
 
-agentModeToggleEl.addEventListener("change", () => {
-  state.agentMode = agentModeToggleEl.checked;
-  if (state.agentMode) {
-    state.latsMode = false;
-  }
+planSolveModeToggleEl.addEventListener("change", () => {
+  state.latsMode = false;
   renderHeader();
 });
 
 latsModeToggleEl.addEventListener("change", () => {
-  state.latsMode = latsModeToggleEl.checked;
-  if (state.latsMode) {
-    state.agentMode = false;
-  }
+  state.latsMode = true;
   renderHeader();
 });
 
@@ -599,6 +722,193 @@ assetForm.addEventListener("submit", async (event) => {
   }
 });
 
+const RESUMABLE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
+const RESUMABLE_UPLOAD_CONCURRENCY = 3;
+const MD5_S = [
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
+const MD5_K = Array.from({ length: 64 }, (_, index) => Math.floor(Math.abs(Math.sin(index + 1)) * 2 ** 32) >>> 0);
+
+function leftRotate(value, amount) {
+  return ((value << amount) | (value >>> (32 - amount))) >>> 0;
+}
+
+function createMd5() {
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+  let totalBytes = 0n;
+  let pending = new Uint8Array(0);
+
+  function processBlock(block, offset) {
+    const words = new Array(16);
+    for (let i = 0; i < 16; i += 1) {
+      const j = offset + i * 4;
+      words[i] = (block[j] | (block[j + 1] << 8) | (block[j + 2] << 16) | (block[j + 3] << 24)) >>> 0;
+    }
+    let a = a0;
+    let b = b0;
+    let c = c0;
+    let d = d0;
+    for (let i = 0; i < 64; i += 1) {
+      let f;
+      let g;
+      if (i < 16) {
+        f = (b & c) | (~b & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * i) % 16;
+      }
+      const next = d;
+      d = c;
+      c = b;
+      b = (b + leftRotate((a + f + MD5_K[i] + words[g]) >>> 0, MD5_S[i])) >>> 0;
+      a = next;
+    }
+    a0 = (a0 + a) >>> 0;
+    b0 = (b0 + b) >>> 0;
+    c0 = (c0 + c) >>> 0;
+    d0 = (d0 + d) >>> 0;
+  }
+
+  function append(bytes, countBytes = true) {
+    const input = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    if (countBytes) {
+      totalBytes += BigInt(input.length);
+    }
+    let combined = input;
+    if (pending.length) {
+      combined = new Uint8Array(pending.length + input.length);
+      combined.set(pending);
+      combined.set(input, pending.length);
+      pending = new Uint8Array(0);
+    }
+    const fullLength = combined.length - (combined.length % 64);
+    for (let offset = 0; offset < fullLength; offset += 64) {
+      processBlock(combined, offset);
+    }
+    pending = combined.slice(fullLength);
+  }
+
+  function digest() {
+    const bitLength = totalBytes * 8n;
+    const paddingLength = Number((56n - ((totalBytes + 1n) % 64n) + 64n) % 64n);
+    const padding = new Uint8Array(1 + paddingLength + 8);
+    padding[0] = 0x80;
+    for (let i = 0; i < 8; i += 1) {
+      padding[1 + paddingLength + i] = Number((bitLength >> BigInt(8 * i)) & 0xffn);
+    }
+    append(padding, false);
+    const words = [a0, b0, c0, d0];
+    return words
+      .flatMap((word) => [word & 0xff, (word >>> 8) & 0xff, (word >>> 16) & 0xff, (word >>> 24) & 0xff])
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  return { update: append, digest };
+}
+
+async function computeFileMd5(file, onProgress) {
+  const md5 = createMd5();
+  const hashChunkSize = 4 * 1024 * 1024;
+  let offset = 0;
+  while (offset < file.size) {
+    const end = Math.min(offset + hashChunkSize, file.size);
+    const buffer = await file.slice(offset, end).arrayBuffer();
+    md5.update(new Uint8Array(buffer));
+    offset = end;
+    onProgress?.(offset, file.size);
+  }
+  return md5.digest();
+}
+
+function setUploadProgress(message) {
+  const progressEl = document.getElementById("asset-upload-progress");
+  if (progressEl) {
+    progressEl.textContent = message;
+  }
+}
+
+async function uploadAssetFileResumable(file, formData) {
+  assetUploadSubmitEl.disabled = true;
+  assetUploadSubmitEl.textContent = "计算MD5...";
+  setUploadProgress("正在计算文件 MD5...");
+  const fileMd5 = await computeFileMd5(file, (done, total) => {
+    setUploadProgress(`正在计算 MD5：${Math.round((done / total) * 100)}%`);
+  });
+  assetUploadSubmitEl.textContent = "准备上传...";
+  const initStatus = await request("/api/v1/assets/uploads/init", {
+    method: "POST",
+    body: JSON.stringify({
+      filename: file.name,
+      file_size: file.size,
+      file_md5: fileMd5,
+      chunk_size: RESUMABLE_UPLOAD_CHUNK_SIZE,
+      title: String(formData.get("upload_title") || "").trim(),
+      asset_type: String(formData.get("asset_type") || ""),
+    }),
+  });
+  if (initStatus.finalized && initStatus.asset) {
+    setUploadProgress("文件已上传过，已直接复用资产。");
+    return initStatus.asset;
+  }
+  const chunkSize = initStatus.chunk_size || RESUMABLE_UPLOAD_CHUNK_SIZE;
+  const missing = [...(initStatus.missing_chunks || [])];
+  let uploaded = initStatus.uploaded_count || 0;
+  setUploadProgress(`已找到 ${uploaded}/${initStatus.total_chunks} 个分片，继续上传缺失部分。`);
+
+  async function uploadOne(chunkIndex) {
+    const start = chunkIndex * chunkSize;
+    const end = Math.min(start + chunkSize, file.size);
+    const chunkBody = new FormData();
+    chunkBody.append("chunk_index", String(chunkIndex));
+    chunkBody.append("chunk", file.slice(start, end), `${file.name}.part-${chunkIndex}`);
+    await request(`/api/v1/assets/uploads/${fileMd5}/chunks`, {
+      method: "POST",
+      body: chunkBody,
+    });
+    uploaded += 1;
+    assetUploadSubmitEl.textContent = `上传中 ${uploaded}/${initStatus.total_chunks}`;
+    setUploadProgress(`上传分片 ${uploaded}/${initStatus.total_chunks}`);
+  }
+
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(RESUMABLE_UPLOAD_CONCURRENCY, missing.length) }, async () => {
+    while (cursor < missing.length) {
+      const chunkIndex = missing[cursor];
+      cursor += 1;
+      await uploadOne(chunkIndex);
+    }
+  });
+  await Promise.all(workers);
+  assetUploadSubmitEl.textContent = "合并中...";
+  setUploadProgress("所有分片已上传，正在 MinIO 合并并导入资产...");
+  const completeStatus = await request(`/api/v1/assets/uploads/${fileMd5}/complete`, {
+    method: "POST",
+    body: JSON.stringify({
+      title: String(formData.get("upload_title") || "").trim(),
+      asset_type: String(formData.get("asset_type") || ""),
+    }),
+  });
+  if (!completeStatus.asset) {
+    throw new Error("分片上传已完成，但资产创建失败。");
+  }
+  setUploadProgress("导入完成。");
+  return completeStatus.asset;
+}
+
 assetUploadForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -615,16 +925,7 @@ assetUploadForm.addEventListener("submit", async (event) => {
       mime_type: file.type || "unknown",
       asset_type: String(formData.get("asset_type") || ""),
     });
-    assetUploadSubmitEl.disabled = true;
-    assetUploadSubmitEl.textContent = "导入中...";
-    const uploadBody = new FormData();
-    uploadBody.append("file", file);
-    uploadBody.append("title", String(formData.get("upload_title") || "").trim());
-    uploadBody.append("asset_type", String(formData.get("asset_type") || ""));
-    const asset = await request("/api/v1/assets/upload-file", {
-      method: "POST",
-      body: uploadBody,
-    });
+    const asset = await uploadAssetFileResumable(file, formData);
     console.info("[asset-upload] complete", {
       filename: file.name,
       asset_id: asset.id,
@@ -640,6 +941,7 @@ assetUploadForm.addEventListener("submit", async (event) => {
   } finally {
     assetUploadSubmitEl.disabled = false;
     assetUploadSubmitEl.textContent = "导入文件";
+    setUploadProgress("");
   }
 });
 

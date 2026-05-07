@@ -26,6 +26,9 @@ from app.models import (
     ProjectCreate,
     ProjectResponse,
     ProjectUpdate,
+    ResumableUploadCompleteRequest,
+    ResumableUploadInitRequest,
+    ResumableUploadStatusResponse,
     ResearchRunDetailResponse,
     ResearchTurnRequest,
     TurnScopedRequest,
@@ -42,6 +45,7 @@ from app.services import (
     create_project,
     create_session,
     create_todo,
+    complete_resumable_asset_upload,
     delete_asset,
     delete_project,
     delete_session,
@@ -55,13 +59,17 @@ from app.services import (
     list_sessions,
     list_todos,
     project_to_response,
+    skill_tool_registry_payload,
     stream_agent_events,
     stream_lats_events,
     stream_research_events,
+    init_resumable_asset_upload,
+    resumable_upload_status,
     update_asset,
     update_project,
     update_session,
     update_todo,
+    upload_resumable_asset_chunk,
 )
 from app.vector_store import ensure_vector_store
 
@@ -145,6 +153,11 @@ async def healthz() -> dict[str, object]:
             "qdrant": f"{settings.qdrant_host}:{settings.qdrant_port}",
         },
     }
+
+
+@app.get("/api/v1/skills")
+async def list_skills_endpoint() -> dict[str, object]:
+    return skill_tool_registry_payload()
 
 
 @app.get("/api/v1/projects", response_model=list[ProjectResponse])
@@ -413,6 +426,68 @@ async def list_assets_endpoint(db: Session = Depends(get_db)) -> list[AssetRespo
 @app.post("/api/v1/assets", response_model=AssetResponse)
 async def create_asset_endpoint(payload: AssetCreate, db: Session = Depends(get_db)) -> AssetResponse:
     return create_asset(db, payload)
+
+
+@app.post("/api/v1/assets/uploads/init", response_model=ResumableUploadStatusResponse)
+async def init_resumable_asset_upload_endpoint(
+    payload: ResumableUploadInitRequest,
+    db: Session = Depends(get_db),
+) -> ResumableUploadStatusResponse:
+    try:
+        return init_resumable_asset_upload(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/assets/uploads/{upload_id}/status", response_model=ResumableUploadStatusResponse)
+async def resumable_asset_upload_status_endpoint(
+    upload_id: str,
+    db: Session = Depends(get_db),
+) -> ResumableUploadStatusResponse:
+    try:
+        return resumable_upload_status(db, upload_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/api/v1/assets/uploads/{upload_id}/chunks", response_model=ResumableUploadStatusResponse)
+async def upload_resumable_asset_chunk_endpoint(
+    upload_id: str,
+    chunk_index: int = Form(...),
+    chunk: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> ResumableUploadStatusResponse:
+    try:
+        data = await chunk.read()
+        if not data:
+            raise ValueError("Chunk is empty")
+        return upload_resumable_asset_chunk(
+            db,
+            upload_id,
+            chunk_index=chunk_index,
+            data=data,
+            content_type=chunk.content_type or "application/octet-stream",
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/api/v1/assets/uploads/{upload_id}/complete", response_model=ResumableUploadStatusResponse)
+async def complete_resumable_asset_upload_endpoint(
+    upload_id: str,
+    payload: ResumableUploadCompleteRequest,
+    db: Session = Depends(get_db),
+) -> ResumableUploadStatusResponse:
+    try:
+        return complete_resumable_asset_upload(db, upload_id, payload)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @app.post("/api/v1/assets/upload-file", response_model=AssetResponse)

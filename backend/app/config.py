@@ -26,6 +26,11 @@ class Settings(BaseModel):
     redis_port: int = int(os.getenv("REDIS_PORT", "6379"))
     minio_host: str = os.getenv("MINIO_HOST", "minio")
     minio_port: int = int(os.getenv("MINIO_PORT", "9000"))
+    minio_access_key: str = os.getenv("MINIO_ACCESS_KEY", os.getenv("MINIO_ROOT_USER", "minioadmin"))
+    minio_secret_key: str = os.getenv("MINIO_SECRET_KEY", os.getenv("MINIO_ROOT_PASSWORD", "minioadmin"))
+    minio_bucket_raw: str = os.getenv("MINIO_BUCKET_RAW", "agent-raw")
+    minio_bucket_artifacts: str = os.getenv("MINIO_BUCKET_ARTIFACTS", "agent-artifacts")
+    minio_secure: bool = os.getenv("MINIO_SECURE", "false").lower() in {"1", "true", "yes", "on"}
     qdrant_host: str = os.getenv("QDRANT_HOST", "qdrant")
     qdrant_port: int = int(os.getenv("QDRANT_PORT", "6333"))
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "knowledge_chunks")
@@ -55,6 +60,8 @@ class Settings(BaseModel):
     episodic_memory_limit: int = int(os.getenv("EPISODIC_MEMORY_LIMIT", "4"))
     semantic_memory_limit: int = int(os.getenv("SEMANTIC_MEMORY_LIMIT", "6"))
     upload_max_bytes: int = int(os.getenv("UPLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
+    resumable_upload_max_bytes: int = int(os.getenv("RESUMABLE_UPLOAD_MAX_BYTES", str(1024 * 1024 * 1024)))
+    resumable_upload_chunk_size: int = int(os.getenv("RESUMABLE_UPLOAD_CHUNK_SIZE", str(8 * 1024 * 1024)))
     live_tools_enabled: bool = os.getenv("LIVE_TOOLS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     llm_tool_planner_enabled: bool = os.getenv("LLM_TOOL_PLANNER_ENABLED", "true").lower() in {
         "1",

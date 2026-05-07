@@ -26,12 +26,15 @@ The main workspace keeps conversation, project assets, and run history in one sc
 
 - Project CRUD with dashboard summaries
 - Text, Markdown, and PDF asset creation, editing, and upload
+- Resumable chunked asset uploads with browser-side MD5, Redis bitmap progress, and MinIO chunk compose
 - TODO CRUD and direct TODO execution
 - Project-scoped hybrid retrieval with dense + BM25 fusion
 - Local reranking for evidence ordering
 - Cited answer generation
 - Live/public-information tool routing, with weather questions routed to an external weather tool
 - Optional LATS Agent/MCTS mode for searching tool-decision paths across RAG, web, weather, memory, assets, TODOs, calculator, and final answers
+- Research-oriented skill/tool registry with read-only and side-effect risk metadata
+- Agent/LATS trace tree visualization for decision replay and best-path inspection
 - Layered memory with working, episodic, and semantic recall
 - Run history and detailed execution traces
 - Browser workspace served from the same FastAPI app
@@ -56,7 +59,7 @@ Main building blocks:
 - `BGE-M3`: local dense embeddings
 - `BM25 + jieba`: lexical retrieval and Chinese-aware tokenization
 - `BGE reranker`: local evidence reranking
-- `Redis`, `MinIO`, optional `Ollama`: provisioned in the local stack for planned workflow expansion
+- `Redis`, `MinIO`, optional `Ollama`: resumable upload progress, object chunks, and planned workflow expansion
 
 ## Repository Layout
 
@@ -135,6 +138,10 @@ Important variables:
 | `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | Semantic memory collection name |
 | `EXECUTION_MODE` | `plan_and_solve` | Runtime execution mode |
 | `UPLOAD_MAX_BYTES` | `104857600` | Max uploaded file size in bytes |
+| `RESUMABLE_UPLOAD_MAX_BYTES` | `1073741824` | Max resumable upload file size in bytes |
+| `RESUMABLE_UPLOAD_CHUNK_SIZE` | `8388608` | Browser chunk size for resumable uploads |
+| `MINIO_BUCKET_RAW` | `agent-raw` | Raw object bucket created by the local stack |
+| `MINIO_BUCKET_ARTIFACTS` | `agent-artifacts` | Chunk and composed artifact bucket |
 | `LIVE_TOOLS_ENABLED` | `true` | Enable live/public-information tool routing |
 | `LLM_TOOL_PLANNER_ENABLED` | `true` | Let the LLM choose live tools before falling back to rules |
 | `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | Timeout for one LLM tool-planning call |
@@ -150,6 +157,8 @@ Important variables:
 
 Swagger UI is available at `/docs`.
 
+- `GET /api/v1/skills`: inspect registered research skills and executable tool schemas.
+
 Key endpoints:
 
 | Endpoint | Method | Purpose |
@@ -160,7 +169,10 @@ Key endpoints:
 | `/api/v1/projects` | `GET`, `POST` | List or create projects |
 | `/api/v1/projects/{project_id}` | `GET`, `PATCH`, `DELETE` | Manage a project |
 | `/api/v1/projects/{project_id}/assets` | `GET`, `POST` | List or create project assets |
-| `/api/v1/projects/{project_id}/assets/upload-text` | `POST` | Upload a `.txt` or `.md` asset |
+| `/api/v1/assets/upload-file` | `POST` | Legacy single-request upload for `.txt`, `.md`, `.markdown`, `.pdf` |
+| `/api/v1/assets/uploads/init` | `POST` | Create or resume an MD5-addressed chunked upload |
+| `/api/v1/assets/uploads/{upload_id}/chunks` | `POST` | Upload one file chunk and mark its Redis bitmap bit |
+| `/api/v1/assets/uploads/{upload_id}/complete` | `POST` | Compose MinIO chunks, parse the file, and create an asset |
 | `/api/v1/assets/{asset_id}` | `PATCH`, `DELETE` | Update or delete one asset |
 | `/api/v1/projects/{project_id}/todos` | `GET`, `POST` | List or create TODOs |
 | `/api/v1/todos/{todo_id}` | `PATCH`, `DELETE` | Update or delete one TODO |
@@ -216,7 +228,7 @@ curl http://127.0.0.1:8001/healthz
 
 - The current MVP focuses on text-based and PDF research assets.
 - The browser workspace is served by the backend and is designed for local use.
-- The Docker stack provisions Redis and MinIO for planned workflow growth, but the core research loop today is centered on FastAPI, MySQL, local retrieval, and Qdrant.
+- Redis stores resumable upload metadata and chunk bitmaps; MinIO stores uploaded chunks and composed source files.
 - OCR, report export, and broader workflow integration are still roadmap items.
 
 ## Documentation

@@ -42,6 +42,8 @@ from app.models import (
     ProjectCreate,
     ProjectResponse,
     ProjectUpdate,
+    QueryRewriteResponse,
+    QueryRewriteVariant,
     ResumableUploadCompleteRequest,
     ResumableUploadInitRequest,
     ResumableUploadStatusResponse,
@@ -1045,12 +1047,351 @@ def planned_search_queries(
     )
 
 
-def merge_retrieval_hits(hit_groups: list[tuple[str, list[dict[str, object]]]], limit: int) -> list[dict[str, object]]:
+def infer_query_rewrite_intent(query: str) -> str:
+    lowered = query.lower()
+    if is_lookup_query(query):
+        return "lookup"
+    if any(term in query for term in ("两类", "分类", "分别", "分为哪")) or any(term in lowered for term in ("types of", "categories")):
+        return "taxonomy"
+    if any(term in query for term in ("低信噪比", "低 SNR", "鲁棒", "优势", "稳", "噪声", "信道变化")) or any(
+        term in lowered for term in ("snr", "noisy channel", "robust")
+    ):
+        return "robustness"
+    if any(term in query for term in ("省带宽", "少传", "少发", "冗余比特", "压缩", "开销", "省流", "保持意思", "保持理解")):
+        return "compression"
+    if any(term in query for term in ("对比", "比较", "区别", "差异", "取舍")):
+        return "comparison"
+    if any(term in query for term in ("趋势", "未来", "发展", "挑战", "机会", "方向")):
+        return "trend"
+    if any(term in query for term in ("架构", "系统", "模块", "流程", "pipeline", "链路")):
+        return "architecture"
+    if any(term in query for term in ("选型", "为什么选", "模型", "方法", "算法", "技术")):
+        return "technology_choice"
+    if any(term in query for term in ("评估", "指标", "benchmark", "实验", "效果")):
+        return "evaluation"
+    if any(term in lowered for term in ("security", "privacy")) or any(term in query for term in ("安全", "隐私", "可信", "攻击")):
+        return "safety"
+    if is_concept_overview_query(query):
+        return "concept_overview"
+    return "general"
+
+
+def normalize_standalone_query(query: str, subject: str) -> str:
+    focus = quoted_title(query) or compact_text(subject, 120)
+    normalized = re.sub(r"[《》“”\"'，。！？?、]", " ", query)
+    normalized = compact_text(re.sub(r"\s+", " ", normalized), 160)
+    if any(term in query for term in ("它", "这个", "该方法", "这篇", "上述", "前面")) and focus and focus not in normalized:
+        return compact_text(f"{focus} {normalized}", 180)
+    if focus and len(normalized) < 18 and focus not in normalized:
+        return compact_text(f"{focus} {normalized}", 180)
+    return normalized or query
+
+
+def semantic_communication_expansion(text: str, intent: str) -> list[str]:
+    lowered = text.lower()
+    semantic_related = (
+        "语义" in text
+        or "semantic" in lowered
+        or "deepsc" in lowered
+        or "r-deepsc" in lowered
+        or "switchac" in lowered
+        or "dib" in lowered
+        or "ddib" in lowered
+        or "snr" in lowered
+        or "sentence similarity" in lowered
+        or "superimposed pilot" in lowered
+        or "selective retransmission" in lowered
+        or "6g" in lowered
+        or "通信" in text
+        or "车联网" in text
+        or "高速" in text
+        or "比特" in text
+        or "少传" in text
+        or "理解" in text
+        or "信噪比" in text
+        or "任务导向" in text
+    )
+    if not semantic_related:
+        return []
+    priority_terms: list[str] = []
+    if "r-deepsc" in lowered or "semantic noise" in lowered or "语义噪声" in text:
+        priority_terms.extend(["R-DeepSC", "literal semantic noise", "adversarial semantic noise"])
+        if intent != "taxonomy":
+            priority_terms.extend(["calibrated self-attention", "adversarial training"])
+    if (
+        ("deepsc" in lowered and "r-deepsc" not in lowered)
+        or "sentence similarity" in lowered
+        or "低信噪比" in text
+        or "句子意思" in text
+    ):
+        priority_terms.extend(["DeepSC", "sentence similarity", "Transformer", "低SNR", "语义相似度", "句子语义"])
+    if "deepsc-st" in lowered or "语音" in text:
+        priority_terms.extend(["DeepSC-ST", "语音识别", "语音合成", "语义特征", "文本恢复", "音频恢复"])
+    if "任务导向" in text or "task-oriented" in lowered or "边缘" in text or "dib" in lowered or "ddib" in lowered:
+        priority_terms.extend(["任务导向语义通信", "边缘推理", "information bottleneck", "DIB", "DDIB", "rate-relevance tradeoff"])
+    if "selective retransmission" in lowered or "重传" in text:
+        priority_terms.extend(["selective retransmission", "选择性重传", "多设备语义通信", "错误语义片段", "边缘推理"])
+    if "superimposed pilot" in lowered or "pilot" in lowered or "导频" in text:
+        priority_terms.extend(["superimposed pilot", "叠加导频", "高速移动", "信道估计", "多普勒频移"])
+    if "switchac" in lowered or "文本和音频" in text or "动态信道" in text:
+        priority_terms.extend(["SwitchAC-SIP", "动态信道", "文本语义", "音频语义", "带宽动态分配"])
+    if any(term in text for term in ("压缩", "省流", "频谱", "带宽", "开销", "少传", "理解", "比特")):
+        priority_terms.extend(["语义压缩", "冗余比特", "恢复意义", "语义相似度", "传输开销", "频谱效率"])
+    terms = [
+        "语义通信",
+        "语义编码",
+        "语义解码",
+        "任务导向",
+        "知识库",
+        "信道状态",
+    ]
+    if intent == "architecture":
+        terms.extend(["端到端架构", "语义编码器", "语义解码器", "信道编码", "反馈闭环", "边缘部署"])
+    elif intent == "technology_choice":
+        terms.extend(["Transformer", "知识图谱", "多模态模型", "端侧推理", "轻量化模型", "鲁棒训练"])
+    elif intent == "trend":
+        terms.extend(["6G", "多模态语义通信", "边缘智能", "标准化", "安全隐私", "语义原生网络"])
+    elif intent == "evaluation":
+        terms.extend(["语义相似度", "任务成功率", "频谱效率", "压缩率", "QoE", "鲁棒性"])
+    elif intent == "safety":
+        terms.extend(["隐私保护", "对抗攻击", "可信语义", "鲁棒性", "安全编码"])
+    elif intent == "comparison":
+        terms.extend(["比特传输", "香农通信", "语义层", "任务成功率", "端到端优化"])
+    if any(term in text for term in ("高速", "车联网", "移动", "高铁", "无人机")):
+        terms.extend(["高速移动", "多普勒频移", "快速衰落", "信道时变", "低时延", "鲁棒性"])
+    if any(term in text for term in ("多模态", "图像", "语音", "文本", "视频")):
+        terms.extend(["跨模态对齐", "图像语义", "语音语义", "文本语义", "多模态融合"])
+    if any(term in text for term in ("压缩", "省流", "频谱", "带宽", "开销")):
+        terms.extend(["语义压缩", "冗余比特", "传输开销", "频谱效率", "低比特率"])
+    if (
+        ("deepsc" in lowered and "r-deepsc" not in lowered)
+        or "sentence similarity" in lowered
+        or "低信噪比" in text
+        or "句子意思" in text
+    ):
+        terms.extend(["DeepSC", "sentence similarity", "Transformer", "低SNR", "语义相似度", "句子语义"])
+    if "r-deepsc" in lowered or "semantic noise" in lowered or "语义噪声" in text:
+        terms.extend(["R-DeepSC", "literal semantic noise", "adversarial semantic noise"])
+        if intent != "taxonomy":
+            terms.extend(["calibrated self-attention", "adversarial training"])
+    if "deepsc-st" in lowered or "语音" in text:
+        terms.extend(["DeepSC-ST", "语音识别", "语音合成", "语义特征", "文本恢复", "音频恢复"])
+    if "任务导向" in text or "task-oriented" in lowered or "边缘" in text or "dib" in lowered or "ddib" in lowered:
+        terms.extend(["任务导向语义通信", "边缘推理", "information bottleneck", "DIB", "DDIB", "rate-relevance tradeoff"])
+    if "selective retransmission" in lowered or "重传" in text:
+        terms.extend(["selective retransmission", "选择性重传", "多设备语义通信", "错误语义片段", "边缘推理"])
+    if "superimposed pilot" in lowered or "pilot" in lowered or "导频" in text:
+        terms.extend(["superimposed pilot", "叠加导频", "高速移动", "信道估计", "多普勒频移"])
+    if "switchac" in lowered or "文本和音频" in text or "动态信道" in text:
+        terms.extend(["SwitchAC-SIP", "动态信道", "文本语义", "音频语义", "带宽动态分配"])
+    return dedupe_preserve_order(priority_terms + terms)
+
+
+def step_back_query(query: str, subject: str, intent: str) -> str:
+    focus = quoted_title(query) or compact_text(subject, 100) or compact_text(query, 100)
+    if intent == "lookup":
+        return compact_text(f"{focus} 标题页 作者 年份 机构 元数据", 180)
+    if intent == "taxonomy":
+        return compact_text(f"{focus} 有哪些类型 分类 定义 区别 代表机制", 180)
+    if intent == "robustness":
+        return compact_text(f"{focus} 如何在低SNR noisy channel 快速变化信道下保持语义相似度和任务鲁棒性", 180)
+    if intent == "compression":
+        return compact_text(f"{focus} 如何减少冗余比特 传输开销和带宽占用 同时保持恢复意义和任务准确率", 180)
+    if intent == "architecture":
+        return compact_text(f"{focus} 系统架构由哪些模块组成 如何形成端到端语义传输闭环", 180)
+    if intent == "technology_choice":
+        return compact_text(f"{focus} 技术选型需要在模型能力 鲁棒性 延迟 成本 可部署性之间如何取舍", 180)
+    if intent == "trend":
+        return compact_text(f"{focus} 面向未来6G和智能网络的发展趋势 挑战 标准化 应用方向", 180)
+    if intent == "evaluation":
+        return compact_text(f"{focus} 应如何评价语义保持 任务效果 通信效率 鲁棒性和用户体验", 180)
+    if intent == "comparison":
+        return compact_text(f"{focus} 与传统比特通信相比 在目标 表征 评价指标和系统优化上有什么差异", 180)
+    if intent == "safety":
+        return compact_text(f"{focus} 在隐私 安全 可信 对抗鲁棒性方面需要解决哪些核心问题", 180)
+    return compact_text(f"{focus} 背后的核心概念 原理 适用场景和局限是什么", 180)
+
+
+def hyde_document_query(query: str, subject: str, intent: str) -> str:
+    focus = quoted_title(query) or compact_text(subject, 100) or compact_text(query, 100)
+    lowered = f"{query} {subject}".lower()
+    expansions = " ".join(semantic_communication_expansion(f"{query} {subject}", intent)[:10])
+    if intent == "lookup":
+        return compact_text(f"{focus} 的标题页通常包含作者、机构、年份、摘要和关键词，可用于定位精确事实。", 240)
+    if intent == "taxonomy":
+        return compact_text(f"{focus} 的回答应定位分类定义、类别差异、代表机制和适用条件，而不是泛化到无关趋势。", 240)
+    if intent == "robustness":
+        if "r-deepsc" in lowered or "semantic noise" in lowered or "语义噪声" in query:
+            return compact_text(
+                f"{focus} 通过 calibrated self-attention、语义置信度校准和 adversarial training 抵抗 literal semantic noise 与 adversarial semantic noise，提升鲁棒性。",
+                260,
+            )
+        return compact_text(
+            f"{focus} 的关键是利用语义编码、上下文表示、低SNR鲁棒训练和信道感知机制，在 noisy channel 下优先保持句子语义和任务效果。",
+            260,
+        )
+    if intent == "compression":
+        return compact_text(
+            f"{focus} 通过语义压缩、冗余比特过滤、information bottleneck 和任务相关特征传输降低开销，同时让接收端恢复意义并保持推理准确率。",
+            260,
+        )
+    if intent == "architecture":
+        return compact_text(
+            f"{focus} 的架构通常包括语义编码器、语义解码器、知识库、信道编码、反馈闭环和任务评价模块。{expansions}",
+            260,
+        )
+    if intent == "technology_choice":
+        return compact_text(
+            f"{focus} 的技术选型需要比较 Transformer、知识图谱、多模态模型、轻量化端侧推理和鲁棒训练。{expansions}",
+            260,
+        )
+    if intent == "trend":
+        return compact_text(
+            f"{focus} 的未来趋势包括6G语义原生网络、多模态融合、边缘智能、标准化、安全隐私和可解释评估。{expansions}",
+            260,
+        )
+    if intent == "evaluation":
+        return compact_text(
+            f"{focus} 的评估需要同时关注语义相似度、任务成功率、频谱效率、压缩率、QoE、低时延和鲁棒性。{expansions}",
+            260,
+        )
+    if intent == "comparison":
+        return compact_text(
+            f"{focus} 强调传输含义和任务效果，区别于传统通信只优化比特级可靠性和吞吐量。{expansions}",
+            260,
+        )
+    return compact_text(f"{focus} 涉及定义、原理、系统挑战、应用场景、评价指标和未来方向。{expansions}", 260)
+
+
+def lexical_keyword_query(query: str, subject: str, intent: str) -> str:
+    tokens = tokenize(f"{subject} {query}")
+    expansions = semantic_communication_expansion(f"{query} {subject}", intent)
+    keywords = dedupe_preserve_order([*tokens, *expansions])
+    return compact_text(" ".join(keywords[:18]), 220)
+
+
+def add_query_rewrite_variant(
+    variants: list[QueryRewriteVariant],
+    seen: set[str],
+    *,
+    strategy: str,
+    query: str,
+    weight: float,
+    rationale: str,
+) -> None:
+    normalized = compact_text(re.sub(r"\s+", " ", query), 260)
+    if not normalized:
+        return
+    key = normalized.lower()
+    if key in seen:
+        return
+    seen.add(key)
+    variants.append(
+        QueryRewriteVariant(
+            strategy=strategy,
+            query=normalized,
+            weight=weight,
+            rationale=rationale,
+        )
+    )
+
+
+def build_query_rewrite(
+    query: str,
+    subject: str,
+    *,
+    todo_description: str = "",
+    broaden: bool = False,
+) -> QueryRewriteResponse:
+    if not settings.query_rewrite_enabled:
+        variants = [
+            QueryRewriteVariant(strategy="baseline", query=item, weight=1.0, rationale="legacy planned search query")
+            for item in planned_search_queries(query, subject, todo_description=todo_description, broaden=broaden)[
+                : settings.query_rewrite_max_queries
+            ]
+        ]
+        return QueryRewriteResponse(
+            original_query=query,
+            standalone_query=query,
+            intent="baseline",
+            subject=subject,
+            variants=variants,
+            generated_by="legacy_planned_queries",
+        )
+
+    intent = infer_query_rewrite_intent(query)
+    standalone = normalize_standalone_query(query, subject)
+    variants: list[QueryRewriteVariant] = []
+    seen: set[str] = set()
+    for item in planned_search_queries(query, subject, todo_description=todo_description, broaden=broaden):
+        add_query_rewrite_variant(
+            variants,
+            seen,
+            strategy="baseline_expansion",
+            query=item,
+            weight=1.0,
+            rationale="retain legacy planned_search_queries for recall safety",
+        )
+    add_query_rewrite_variant(
+        variants,
+        seen,
+        strategy="standalone",
+        query=standalone,
+        weight=0.98,
+        rationale="resolve short follow-up or pronoun-heavy query into a standalone search query",
+    )
+    if settings.query_rewrite_step_back_enabled:
+        add_query_rewrite_variant(
+            variants,
+            seen,
+            strategy="step_back",
+            query=step_back_query(query, subject, intent),
+            weight=0.56,
+            rationale="retrieve higher-level principles and architecture context",
+        )
+    add_query_rewrite_variant(
+        variants,
+        seen,
+        strategy="lexical_domain_expansion",
+        query=lexical_keyword_query(query, subject, intent),
+        weight=0.68,
+        rationale="combine lexical keywords with domain expansion terms for sparse retrieval",
+    )
+    if settings.query_rewrite_hyde_enabled and intent not in {"lookup", "taxonomy"}:
+        add_query_rewrite_variant(
+            variants,
+            seen,
+            strategy="hyde",
+            query=hyde_document_query(query, subject, intent),
+            weight=0.54,
+            rationale="HyDE-style hypothetical answer document for dense retrieval",
+        )
+    ordered = sorted(enumerate(variants), key=lambda item: (-item[1].weight, item[0]))
+    selected = [variant for _, variant in ordered[: max(settings.query_rewrite_max_queries, 1)]]
+    return QueryRewriteResponse(
+        original_query=query,
+        standalone_query=standalone,
+        intent=intent,
+        subject=subject,
+        variants=selected,
+        generated_by="deterministic_hybrid_rewrite",
+    )
+
+
+def query_rewrite_search_queries(rewrite: QueryRewriteResponse) -> list[str]:
+    return dedupe_preserve_order([variant.query for variant in rewrite.variants])[: max(settings.query_rewrite_max_queries, 1)]
+
+
+def query_rewrite_weight_map(rewrite: QueryRewriteResponse) -> dict[str, float]:
+    return {variant.query: variant.weight for variant in rewrite.variants}
+
+
+def merge_retrieval_hits(hit_groups: list[tuple[str, list[dict[str, object]], float]], limit: int) -> list[dict[str, object]]:
     merged: dict[str, dict[str, object]] = {}
-    for query_index, (query, hits) in enumerate(hit_groups, start=1):
+    for query_index, (query, hits, weight) in enumerate(hit_groups, start=1):
         for rank, hit in enumerate(hits, start=1):
             chunk_id = str(hit["chunk_id"])
-            boosted_score = float(hit["score"]) + (0.02 / query_index) + (0.01 / rank)
+            boosted_score = (float(hit["score"]) * max(weight, 0.05)) + (0.02 / query_index) + (0.01 / rank)
             current = merged.get(chunk_id)
             if current is None or boosted_score > float(current["score"]):
                 merged[chunk_id] = {
@@ -1167,11 +1508,12 @@ def build_context(
 
 def plan_tasks(request: TurnScopedRequest, *, todo: Todo | None = None) -> PlanTasksResponse:
     subject = todo.description if todo and todo.description else (todo.title if todo else request.user_query)
-    search_queries = planned_search_queries(
+    query_rewrite = build_query_rewrite(
         request.user_query,
         subject,
         todo_description=todo.description if todo else "",
-    )[:3]
+    )
+    search_queries = query_rewrite_search_queries(query_rewrite)
     tasks = [
         ResearchTask(
             task_id="task-1",
@@ -1212,6 +1554,7 @@ def plan_tasks(request: TurnScopedRequest, *, todo: Todo | None = None) -> PlanT
         planner_mode="two_stage",
         plan_summary="Planner 先定义目标与证据需求，Solver 再按步骤检索、校验、综合并沉淀记忆。",
         search_queries=search_queries,
+        query_rewrite=query_rewrite,
         tasks=tasks,
     )
 
@@ -1225,8 +1568,10 @@ def hybrid_retrieve(
     *,
     assets: list[Asset],
     search_queries: list[str],
+    query_weights: dict[str, float] | None = None,
 ) -> RetrieveResponse:
     payloads = chunk_payloads(assets, request.asset_ids)
+    weights = query_weights or {}
     query_hits = [
         (
             search_query,
@@ -1236,6 +1581,7 @@ def hybrid_retrieve(
                 request.asset_ids,
                 payloads,
             ),
+            weights.get(search_query, 1.0),
         )
         for search_query in (search_queries or [request.user_query])
     ]
@@ -1287,10 +1633,29 @@ def execute_plan(
             summary=f"将本轮问题约束为：{compact_text(subject, 140)}",
         )
     )
-    retrieval = hybrid_retrieve(request, assets=assets, search_queries=plan.search_queries)
     append_step(
         PlanExecutionStep(
             step_id="step-2",
+            task_id="task-2",
+            title="Rewrite retrieval queries",
+            action="query_rewrite",
+            summary=(
+                f"生成 {len(plan.search_queries)} 条混合检索查询；"
+                f"intent={plan.query_rewrite.intent}; "
+                f"strategies={', '.join(dedupe_preserve_order([item.strategy for item in plan.query_rewrite.variants]))}。"
+            ),
+            search_queries=plan.search_queries,
+        )
+    )
+    retrieval = hybrid_retrieve(
+        request,
+        assets=assets,
+        search_queries=plan.search_queries,
+        query_weights=query_rewrite_weight_map(plan.query_rewrite),
+    )
+    append_step(
+        PlanExecutionStep(
+            step_id="step-3",
             task_id="task-2",
             title="Primary retrieval",
             action="retrieve",
@@ -1308,24 +1673,33 @@ def execute_plan(
     if should_replan(request.user_query, retrieval):
         replan_count = 1
         replan_reason = "首轮证据覆盖不足，Solver 扩展到标题页/摘要/全文定位查询并再次检索。"
-        replan_queries = planned_search_queries(
+        replan_rewrite = build_query_rewrite(
             request.user_query,
             subject,
             todo_description=todo.description if todo else "",
             broaden=True,
-        )[:5]
+        )
+        replan_queries = query_rewrite_search_queries(replan_rewrite)
         append_step(
             PlanExecutionStep(
-                step_id="step-3",
+                step_id="step-4",
                 task_id="task-2",
                 title="Replan retrieval",
                 action="replan",
-                summary=replan_reason,
+                summary=(
+                    f"{replan_reason} 重写策略："
+                    f"{', '.join(dedupe_preserve_order([item.strategy for item in replan_rewrite.variants]))}。"
+                ),
                 search_queries=replan_queries,
                 evidence_labels=evidence_labels(retrieval),
             )
         )
-        retry_retrieval = hybrid_retrieve(request, assets=assets, search_queries=replan_queries)
+        retry_retrieval = hybrid_retrieve(
+            request,
+            assets=assets,
+            search_queries=replan_queries,
+            query_weights=query_rewrite_weight_map(replan_rewrite),
+        )
         if retrieval_strength(retry_retrieval) >= retrieval_strength(retrieval):
             final_retrieval = retry_retrieval
             final_queries = replan_queries
@@ -1333,7 +1707,7 @@ def execute_plan(
     final_labels = evidence_labels(final_retrieval)
     append_step(
         PlanExecutionStep(
-            step_id="step-4",
+            step_id="step-5",
             task_id="task-3",
             title="Validate evidence",
             action="reason",
@@ -1346,7 +1720,7 @@ def execute_plan(
     )
     append_step(
         PlanExecutionStep(
-            step_id="step-5",
+            step_id="step-6",
             task_id="task-4",
             title="Synthesize answer",
             action="synthesize",
@@ -2487,14 +2861,26 @@ def execute_agent_tool(
     if action == "local_rag_search":
         query = compact_text(str(arguments.get("query") or request.user_query), 240)
         assets = resolve_assets(db)
-        retrieval = hybrid_retrieve(request.model_copy(update={"user_query": query}), assets=assets, search_queries=[query])
+        query_rewrite = build_query_rewrite(query, query)
+        search_queries = query_rewrite_search_queries(query_rewrite)
+        retrieval = hybrid_retrieve(
+            request.model_copy(update={"user_query": query}),
+            assets=assets,
+            search_queries=search_queries,
+            query_weights=query_rewrite_weight_map(query_rewrite),
+        )
         lines = [f"[{item.label}] {item.title}: {item.snippet}" for item in retrieval.evidence_items]
         return AgentToolObservation(
             tool_name=action,
-            summary=f"本地知识库检索返回 {len(retrieval.evidence_items)} 条证据。",
+            summary=f"本地知识库通过 Query Rewrite 检索 {len(search_queries)} 条查询，返回 {len(retrieval.evidence_items)} 条证据。",
             content="\n".join(lines) or "本地知识库没有命中证据。",
             evidence_items=retrieval.evidence_items,
-            metadata={"query": query, "retrieval_mode": retrieval.retrieval_mode},
+            metadata={
+                "query": query,
+                "search_queries": search_queries,
+                "query_rewrite": query_rewrite.model_dump(mode="json"),
+                "retrieval_mode": retrieval.retrieval_mode,
+            },
         )
     if action == "weather_lookup":
         query = str(arguments.get("query") or request.user_query)

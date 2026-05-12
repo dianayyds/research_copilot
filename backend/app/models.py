@@ -205,6 +205,22 @@ class PlanExecutionStep(BaseModel):
     evidence_labels: list[str] = Field(default_factory=list)
 
 
+class QueryRewriteVariant(BaseModel):
+    strategy: str
+    query: str
+    weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    rationale: str = ""
+
+
+class QueryRewriteResponse(BaseModel):
+    original_query: str = ""
+    standalone_query: str = ""
+    intent: str = "general"
+    subject: str = ""
+    variants: list[QueryRewriteVariant] = Field(default_factory=list)
+    generated_by: str = "deterministic_hybrid"
+
+
 class PlanTasksResponse(BaseModel):
     project_id: str
     session_id: str
@@ -212,6 +228,7 @@ class PlanTasksResponse(BaseModel):
     planner_mode: str = "two_stage"
     plan_summary: str = ""
     search_queries: list[str] = Field(default_factory=list)
+    query_rewrite: QueryRewriteResponse = Field(default_factory=QueryRewriteResponse)
     tasks: list[ResearchTask]
     execution_trace: list[PlanExecutionStep] = Field(default_factory=list)
     solver_summary: str = ""

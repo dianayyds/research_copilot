@@ -1,0 +1,461 @@
+Research Copilot 简历 STAR 材料
+整理日期：2026-05-08
+
+一、项目定位
+Research Copilot 是一个本地优先的项目级研究工作台，用于把论文、笔记、PDF、TODO、多轮对话、引用回答、运行轨迹和分层记忆整合到同一个浏览器工作区和 FastAPI 后端中。项目重点不是做一个普通聊天机器人，而是做一个可追溯、可复盘、可扩展到工具调用和长期研究记忆的 AI 研究助手。
+
+核心技术栈：
+- 后端：FastAPI、Pydantic、SQLAlchemy、MySQL、NDJSON Streaming
+- 检索：Qdrant、BGE-M3 embedding、BM25、jieba、BGE reranker
+- Agent：Plan-and-Solve 默认管线、Plan-Act-Observe Agent、LATS/MCTS 工具决策搜索
+- 记忆：working memory、episodic memory、semantic memory，语义记忆使用 MySQL + Qdrant
+- 文件能力：文本、Markdown、PDF 解析，浏览器 MD5 + Redis bitmap + MinIO compose 的断点续传
+- 工程化：Docker Compose、本地优先配置、pytest、ASGITransport 测试、stub vector store
+
+主要代码证据：
+- backend/app/services.py：运行编排、Plan-and-Solve、Agent、LATS、断点续传、答案质量评估
+- backend/app/memory_manager.py：三层记忆写入、召回和上下文构建
+- backend/app/vector_store.py：dense + BM25 融合检索、Qdrant、BGE embedding、BGE reranker
+- backend/app/semantic_store.py：语义记忆向量化、混合召回和重排
+- backend/app/live_tools.py：天气和公开搜索工具路由
+- backend/app/main.py：REST API、流式接口、静态工作区
+- backend/tests/test_workspace_api.py：端到端工作流、记忆隔离、LATS、Agent、上传、流式事件测试
+
+
+二、简历精简版项目描述
+
+项目名称：Research Copilot，本地优先 AI 研究工作台
+
+可放在简历上的版本：
+从 0 到 1 开发本地优先 Research Copilot，基于 FastAPI + SQLAlchemy/MySQL + Qdrant + BGE-M3 + BM25/jieba + BGE reranker 构建项目级知识工作台，支持文本/Markdown/PDF 导入、多轮会话、TODO 执行、引用回答、运行历史和 working/episodic/semantic 三层记忆。
+
+设计默认 Plan-and-Solve 研究管线，将一次问答拆成目标澄清、证据检索、证据校验、答案综合和记忆沉淀，解决自由 Agent 难复盘、难稳定输出的问题，并通过 execution_trace、citations、answer_quality 暴露执行过程和答案可信度。
+
+实现可选 LATS/MCTS Agent 模式，把 RAG、公开搜索、天气、记忆、资产列表、TODO、计算器等能力抽象为工具，在有限迭代预算内搜索工具决策树，并输出 best path 和 trace tree，用于处理多工具路径不确定、单一路由失败后需要恢复的问题。
+
+设计三层记忆体系：working memory 保存会话内近期轮次，episodic memory 保存项目级研究事件，semantic memory 抽取 fact/open_question/progress/decision/preference 等结构化事实并写入向量库，实现跨会话长期召回，同时避免会话短期记忆跨项目或跨会话污染。
+
+实现浏览器侧 MD5 分片上传、Redis bitmap 记录分片进度、MinIO compose 合并对象和服务端 MD5 校验，支持大文件断点续传、重复上传复用资产，并在上传完成后自动解析资产并同步向量索引。
+
+构建 pytest 测试覆盖核心链路，包括项目/会话/资产/TODO API、Plan-and-Solve 执行、记忆隔离、LLM fallback、实时工具路由、Agent 工具循环、LATS 路径恢复、流式事件、PDF/Markdown 上传和断点续传。
+
+
+三、STAR 1：项目总体架构
+
+S - Situation：
+个人研究或研发项目中的资料通常分散在论文、笔记、代码说明、TODO 和多轮对话中。普通聊天机器人只能处理当前 prompt，无法稳定追踪项目资产、历史运行和长期记忆，也缺少引用证据和执行轨迹，面向研究工作时容易出现不可复盘和不可验证的问题。
+
+T - Task：
+需要搭建一个本地优先的研究工作台，让用户可以在一个项目空间内导入资料、提出问题、执行 TODO、查看引用、回放运行历史，并把每次研究结果沉淀为可复用记忆。系统还要能在没有真实 LLM key 的情况下保持端到端可运行，方便本地开发和测试。
+
+A - Action：
+选择 FastAPI 作为统一服务入口，同时提供 REST API、流式接口和静态前端，降低本地部署复杂度。使用 SQLAlchemy + MySQL 持久化项目、会话、TODO、运行记录和记忆；使用 Qdrant 承载知识分块和语义记忆；使用 Docker Compose 管理 MySQL、Redis、MinIO、Qdrant 等依赖。
+
+把运行时设计成可插拔的三条路径：默认 Plan-and-Solve 管线用于稳定研究问答；Plan-Act-Observe Agent 用于多步工具调用；LATS/MCTS Agent 用于对不确定工具路径进行搜索。所有路径都统一落到 context、plan、retrieval、answer、memory 和 trace_id 这些结构化结果上，便于前端展示和历史追踪。
+
+R - Result：
+项目形成了完整闭环：创建项目、创建会话、上传资料、执行研究、生成引用回答、沉淀分层记忆、查看运行历史。前后端由同一个服务启动，适合本地演示；测试中已覆盖 33 个用例，验证了核心 API、流式执行、记忆隔离、Agent/LATS 和断点续传等行为。
+
+面试讲法：
+这个项目我不是按普通 Chat UI 做的，而是先定义“研究工作台”的状态模型。用户每次提问都会生成结构化 run，里面包括上下文、计划、证据、答案、记忆更新和 trace_id。这样我可以解释每个答案从哪里来，也能把运行结果继续喂给后续轮次。
+
+
+四、STAR 2：为什么默认选择 Plan-and-Solve
+
+S - Situation：
+研究问答和代码/论文理解类任务通常需要先明确问题目标，再检索证据，最后综合答案。如果直接使用自由 ReAct 或开放式 Agent 循环，模型可能在工具之间反复跳转，输出路径不稳定，历史记录也不容易审计。
+
+T - Task：
+需要一个默认执行架构，既能让回答质量稳定，又能把中间过程展示给用户，还能和后续工作流节点对接。它应该适合大多数“基于项目资料回答问题”的场景，而不是每次都让 Agent 自由探索。
+
+A - Action：
+采用 Plan-and-Solve 作为默认管线。Planner 先输出固定任务：Clarify objective、Collect evidence、Validate and align、Synthesize answer；Solver 再根据计划生成检索 query、执行混合检索、判断证据是否足够、必要时 replan，并最终生成带引用答案和记忆更新。
+
+技术选型原因：
+- 稳定性：固定阶段比自由 Agent 更容易控制，适合作为默认模式。
+- 可解释性：每一步都生成 execution_trace，用户能看到 scope、retrieve、replan、reason、synthesize。
+- 可测试性：计划、检索、答案、记忆都是结构化 Pydantic schema，方便写端到端测试。
+- 可扩展性：specs/workflows/research-copilot.yaml 里已经把流程映射成 resolve_project、pack_context、plan_research、retrieve_evidence、rank_evidence、synthesize_answer、persist_memory 等节点，后续可以接入工作流编排。
+
+R - Result：
+Plan-and-Solve 成为项目的稳定默认路径，适合本地知识库问答、论文摘要、项目资料总结等任务。系统在证据弱时会自动触发 replan，扩展到标题页、摘要、全文等查询，并在最终结果里保留 replan_count 和 replan_reason，便于用户判断答案是否经历过补充检索。
+
+面试讲法：
+我选择 Plan-and-Solve 是因为这个项目的默认问题不是“模型想调用什么工具”，而是“用户问项目资料里的事实和结论”。这种任务有稳定阶段：先定目标，再找证据，再综合。固定管线能降低 Agent 不确定性，也让执行过程能被前端和测试稳定消费。
+
+
+五、STAR 3：为什么还要引入 LATS/MCTS
+
+S - Situation：
+Plan-and-Solve 对本地资料问答很稳，但它本质是单一路径：计划、检索、回答。当问题需要在多个工具之间选择时，例如“联网查最新信息”“天气是否适合出游”“先查资料再创建 TODO”“计算并记住结果”，单一路由一旦选错工具，就可能直接失败或给出较弱答案。
+
+T - Task：
+需要一个可选的高阶 Agent 模式，在工具路径不确定时能比较多个候选动作，而不是只走模型第一次选择的动作。这个模式还需要能把搜索树可视化出来，方便解释为什么选择某条路径。
+
+A - Action：
+实现 LATS Agent/MCTS 模式，把 RAG、public_web_search、weather_lookup、memory_read、asset_list、todo_list、calculator、final_answer 等动作抽象成工具决策节点。每轮执行 selection、expansion、evaluation、backpropagation：
+- selection：用 UCB 从当前树中选择最值得探索的节点。
+- expansion：由 LLM expansion policy 或规则 fallback 生成候选工具动作。
+- action/observation：执行工具，收集 observation 和 evidence。
+- evaluation：由 LLM value evaluator 或启发式评分判断该路径价值。
+- backpropagation：把分数回传到父节点，更新 visits 和 value_sum。
+- final：选平均价值最高的节点作为 best path，综合答案并输出 trace_tree。
+
+技术选型原因：
+- LATS 不是替代 RAG，而是搜索“工具决策路径”。RAG 只是候选工具之一。
+- MCTS 适合在有限预算内平衡探索和利用，比单步路由更容易从失败路径恢复。
+- 对于存在多种信息来源的问题，LATS 可以同时比较本地资料、公开搜索、记忆和计算器。
+- LATS 模式只允许只读/低副作用工具参与搜索，并把 memory_write、todo_create 这类副作用动作排除在 safe actions 之外，避免搜索过程产生不可控写入。
+
+R - Result：
+系统能在 LATS 模式下输出 Agent 搜索树、best path、节点 score、visits、prior、reflection 和 evidence_labels。测试覆盖了计算题优先选择 calculator、公开搜索失败后回退到 local_rag_search、概念讲解问题避免只依赖 memory_read 等场景，证明 LATS 能处理路径不确定和工具失败恢复。
+
+面试讲法：
+Plan-and-Solve 是默认稳定路径，LATS 是高不确定性场景的增强模式。比如一个问题可能需要联网，也可能本地资料已经有答案。普通 Agent 只选一次工具，选错就失败；LATS 会把工具调用看成搜索树，用 MCTS 在预算内比较多个分支，最后选择价值最高的路径。为了避免副作用，我把 LATS 限制在只读工具上。
+
+
+六、STAR 4：三层记忆是怎么做的
+
+S - Situation：
+LLM 本身不具备项目级长期状态。研究场景又很依赖上下文：用户刚才问过什么、某个 TODO 推进到哪一步、项目里已经形成了哪些事实或决策。如果所有历史都直接塞进 prompt，会导致上下文膨胀、无关信息干扰和跨会话污染。
+
+T - Task：
+需要设计一个能支持短期追问、跨会话复用和长期语义召回的记忆系统，并且保证项目之间隔离、会话内 working memory 不泄漏到其他会话。
+
+A - Action：
+设计 working、episodic、semantic 三层记忆：
+
+working memory：
+- 保存当前会话最近轮次的 query 和 answer 摘要。
+- 通过 WORKING_MEMORY_LIMIT 做裁剪，适合“刚才说了什么”这种短期追问。
+- session_id 绑定，第二个会话不会看到第一个会话的 working memory。
+
+episodic memory：
+- 保存项目级研究事件，例如一次 research_run 的摘要、query、answer_summary、citations、todo_title。
+- 召回时结合词项重叠、更新时间 recency 和 importance 打分。
+- 适合跨会话回顾“这个项目之前做过什么”。
+
+semantic memory：
+- 从问答中抽取结构化事实，包括 fact、open_question、progress、decision、preference。
+- 每条事实包含 subject、predicate、object、importance、metadata。
+- 写入 MySQL 作为结构化存储，同时写入 Qdrant 作为语义检索入口。
+- 召回时使用 dense search + BM25 + reranker，适合“项目记住的长期事实是什么”。
+
+上下文构建：
+- build_memory_context_bundle 分别构造 Working Memory、Episodic Memory、Semantic Memory 三段。
+- build_context 将三层记忆、项目状态、资产范围、当前 query 打包进 packed_context。
+- memory_read 工具会按用户问题做 focused filtering，避免把无关历史原样塞给模型。
+
+R - Result：
+系统既支持同会话的短期追问，也支持跨会话的长期项目记忆。测试验证了第二个会话看不到第一个会话的 working memory，但能看到项目级 episodic 和 semantic memory；也验证了记忆读取会过滤无关片段，避免例如“讲语义通信”时混入“特朗普年龄”这类无关记忆。
+
+面试讲法：
+我没有把历史对话简单拼接进 prompt，而是按用途拆成三层。working 解决短期连续对话，episodic 解决项目事件回顾，semantic 解决长期事实召回。这样做的好处是召回粒度更清楚，也能控制会话和项目边界。
+
+
+七、STAR 5：混合检索和引用回答
+
+S - Situation：
+研究资料里既有语义相近的问题，也有精确实体、论文标题、作者、年份等查询。只用 dense embedding 容易漏掉精确词，只用 BM25 又不擅长语义相关；中文资料还需要更合适的分词。
+
+T - Task：
+需要实现一个本地优先、支持中文、能兼顾语义和词法匹配的检索链路，并把检索结果作为引用证据返回给答案生成模块。
+
+A - Action：
+实现 dense + sparse + rerank 的混合检索：
+- 文档导入后按 Markdown section 和长度切块，chunk_id 包含 asset_id、heading 和序号，source_path 能定位到资产章节。
+- 使用 BGE-M3 生成 dense embedding，并写入 Qdrant。
+- 使用 jieba + rank-bm25 做中文词法检索。
+- 使用 reciprocal rank fusion 合并 dense 和 sparse 候选。
+- 使用 BGE reranker 对候选证据做最终排序。
+- 生成 EvidenceItem，包含 asset_id、chunk_id、label、title、snippet、source_path、score、tags。
+- AnswerResponse 使用 citations_from_evidence 把证据标签转成可引用 citation。
+
+技术选型原因：
+- Qdrant 适合本地部署和向量过滤，方便后续扩展多 collection。
+- BGE-M3 支持中英混合和长文本语义表示，适合论文、笔记、代码说明。
+- BM25 + jieba 能提升中文关键词、标题、作者等精确查询的召回。
+- reranker 把召回和排序分离，能提高最终引用证据的相关性。
+
+R - Result：
+系统能为答案返回 C1、C2 等引用标签，并在执行轨迹中记录检索 query 和 evidence_labels。测试覆盖了资产检索命中、引用数量与证据数量一致、答案质量 grounded 标记等行为。
+
+面试讲法：
+我这里做的是典型 hybrid RAG：dense 负责语义相似，BM25 负责关键词和标题，reranker 负责最后的精排。这样比单纯向量检索更适合中文论文/笔记场景，也能把每条回答绑定回具体 chunk 和资产路径。
+
+
+八、STAR 6：工具路由和 skill/tool registry
+
+S - Situation：
+研究助手不只会查本地文档。有些问题需要实时天气，有些需要公开网络摘要，有些需要查看 TODO、读取记忆或做简单计算。如果所有能力都混在 prompt 里，模型很难知道哪些工具有副作用，前端也很难展示能力边界。
+
+T - Task：
+需要一套工具抽象，让运行时、Agent 和前端都能知道可用工具、输入 schema、所属 skill、是否只读、风险等级和标签。
+
+A - Action：
+实现 ResearchSkillSpec 和 AgentToolSpec 注册表，并提供 GET /api/v1/skills 接口。当前注册的 skill 包括：
+- project_literature_rag：本地资料检索
+- public_literature_lookup：公开资料检索
+- research_memory：读取研究记忆
+- asset_inventory：资料资产盘点
+- quantitative_check：数值计算
+- research_task_management：TODO 管理
+- fieldwork_context：天气/外出调研上下文
+- research_memory_write：写入短期工作记忆
+
+工具元数据包括 read_only 和 risk_level。LATS 使用 read_only 过滤安全动作，Agent loop 则允许在明确用户意图下执行 todo_create 和 memory_write。
+
+R - Result：
+工具能力从硬编码函数变成可查询的 registry。前端和调试接口可以看到工具列表，LATS 能据此限制搜索空间，测试也验证了 local_rag_search 是只读、todo_create 是 medium risk 的副作用工具。
+
+面试讲法：
+我把工具先注册成 skill/tool schema，而不是直接散落在 if/else 里。这样 Agent 可以读 schema 做决策，LATS 可以根据 read_only 做安全过滤，前端也可以展示系统到底有什么能力。
+
+
+九、STAR 7：实时工具和 fallback 设计
+
+S - Situation：
+本地知识库适合回答项目资料问题，但遇到天气、最新公开信息、年龄日期等问题时，如果仍然强行走本地 RAG，就会出现过时或无证据答案。同时，外部工具也可能失败，不能把内部错误直接暴露给用户。
+
+T - Task：
+需要让系统区分本地知识问题和实时/公开信息问题，并在工具失败或检索无证据时提供用户友好的 fallback。
+
+A - Action：
+实现 live tool router：
+- 规则路由识别天气、气温、降水、最新、公开资料、搜索等意图。
+- 可选 LLM tool planner 在规则之前判断是否需要实时工具。
+- weather_lookup 调用 Open-Meteo，返回实时天气证据。
+- public_web_search 调用 DuckDuckGo Instant Answer，返回公开摘要证据。
+- 工具结果统一转成 EvidenceItem，可被引用。
+- 如果工具失败或本地检索没有证据，try_direct_llm_answer 会启用直接 LLM fallback，并明确要求不要编造引用、不要暴露“当前知识库找不到”这类内部失败话术。
+
+R - Result：
+天气问题会优先进入 weather_lookup，而不是本地 RAG；公开信息可以走 web search；外部工具失败时，系统会给出更自然的 fallback 答案，并且不伪造 citation。测试覆盖了天气路由、LLM planner 选择天气、公开搜索失败后的 fallback、无证据流式回答 fallback。
+
+面试讲法：
+我把“是否需要实时工具”放在本地 RAG 之前判断。因为 RAG 里的项目知识可能过时，天气这类问题必须走外部工具。工具失败时也不能把内部错误扔给用户，所以我做了 direct LLM fallback，并且禁止编造引用。
+
+
+十、STAR 8：断点续传上传
+
+S - Situation：
+研究资料经常包含 PDF 或较大的文本文件。普通单请求上传对大文件不稳定，一旦网络中断就要重传全部内容，也不利于后续接入对象存储。
+
+T - Task：
+需要支持大文件断点续传、重复上传识别、服务端合并校验，并在上传完成后自动进入资产解析和向量索引流程。
+
+A - Action：
+实现浏览器 MD5 + Redis bitmap + MinIO 分片合并：
+- 前端按 4MB 计算浏览器 MD5，以 file_md5 作为 upload_id。
+- /api/v1/assets/uploads/init 根据 MD5 初始化或恢复上传状态。
+- Redis hash 保存 upload meta，Redis bitmap 标记每个 chunk 是否完成。
+- 前端读取 missing_chunks，只上传缺失分片，并支持并发上传。
+- MinIO 保存分片对象，complete 阶段使用 compose_object 合并。
+- 服务端读取合并对象并重新计算 MD5，校验通过后解析文本/Markdown/PDF，并创建 Asset。
+- 如果同一个 MD5 已 finalized，再次 init 会直接复用已有 asset。
+
+技术选型原因：
+- Redis bitmap 非常适合记录 chunk index 是否上传，空间占用小、状态查询快。
+- MinIO 兼容对象存储模型，本地部署简单，后续可以替换为 S3 类服务。
+- MD5 作为 upload_id 能天然支持重复上传复用和断点恢复。
+
+R - Result：
+系统支持 1GB 级别的可恢复上传配置，前端能显示 MD5 计算、分片上传和 MinIO 合并进度。测试验证了先上传第 0 和第 2 个分片、再次 init 恢复缺失第 1 个分片、补齐后 complete 创建资产、重复 init 直接返回已 finalized asset。
+
+面试讲法：
+这块我没有简单调一个 upload-file 接口，而是按对象存储思路做了 resumable upload。浏览器先算 MD5，服务端用 Redis bitmap 记录缺哪些分片，MinIO 负责分片和合并，最后再做 MD5 校验，保证恢复上传和重复上传都可控。
+
+
+十一、STAR 9：答案质量评估和可观测性
+
+S - Situation：
+AI 应用里最麻烦的问题不是只生成答案，而是判断答案是否可信、有没有证据、是否用了 fallback、是否有工具失败。如果这些状态不可见，用户只能看到一段文本，工程上也难以调试。
+
+T - Task：
+需要把答案质量变成结构化数据，帮助前端、测试和后续评估系统识别弱答案。
+
+A - Action：
+实现 AnswerQualityReport：
+- score：0 到 5 分
+- level：质量等级
+- evidence_count：证据数量
+- citation_count：引用数量
+- grounded：是否有证据、有引用、有答案且未使用 fallback
+- fallback_used：是否走了 fallback
+- signals：正向信号，例如 answer_present、trace_steps、citations_match_evidence
+- gaps：风险点，例如 no_retrieved_evidence、weak_top_evidence、fallback_steps
+- next_actions：后续建议，例如 refine retrieval queries、import relevant assets
+
+质量评估基于 plan.execution_trace、retrieval.evidence_items、answer.citations、answer 文本、memory_updates 和 fallback 痕迹。
+
+R - Result：
+每次运行不仅返回答案，还返回质量解释。测试验证了 grounded、evidence_count、citation_count、gaps、next_actions 等字段，方便把“AI 答案是否可信”从主观判断转成可观测指标。
+
+面试讲法：
+我把答案质量做成结构化 report，而不是只靠前端显示答案。这样如果没有证据、引用不匹配、工具失败或用了 fallback，系统都能明确暴露出来，后续也可以接评测或监控。
+
+
+十二、STAR 10：流式执行轨迹和前端工作区
+
+S - Situation：
+Agent 和 LATS 的执行时间可能较长，如果用户只能等待最终答案，会感觉系统卡住，也看不到中间工具选择。尤其是 LATS 有搜索树，最终答案之外的决策过程本身就是重要信息。
+
+T - Task：
+需要让前端实时展示计划、工具调用、检索、搜索树、答案增量和最终完整 run。
+
+A - Action：
+后端提供三类流式接口：
+- /run/stream：Plan-and-Solve 流式执行
+- /agent/run/stream：Plan-Act-Observe Agent 流式执行
+- /lats/run/stream：LATS/MCTS 流式执行
+
+流式格式使用 application/x-ndjson，事件类型包括 plan、trace、trace_tree、solver_summary、answer_delta、answer_quality、complete。前端读取 ReadableStream，逐行解析 JSON，实时更新 streamingRun、execution_trace 和 trace_tree。
+
+前端工作区提供 Plan-and-Solve Agent 和 LATS Agent 模式切换，并渲染 Agent 搜索树，包括 action、skill、score、visits、best path 和 reflection。
+
+R - Result：
+用户可以在同一工作区中看到对话、资产、执行轨迹、引用和 LATS 搜索树。测试覆盖了 plan、trace、trace_tree、answer_delta、complete 等流式事件，证明前后端协议稳定。
+
+面试讲法：
+我用 NDJSON 做流式事件，而不是只用最终 HTTP 响应。这样前端能实时展示 Agent 的每一步，也能展示 LATS 的搜索树。对研究助手来说，可解释过程和最终答案同样重要。
+
+
+十三、STAR 11：数据边界和安全性
+
+S - Situation：
+研究工作台里同时存在全局资料资产、项目、会话、TODO 和记忆。如果边界不清，容易出现项目 A 的记忆污染项目 B，或者删除项目时误删全局资产。
+
+T - Task：
+需要明确数据边界：资产可以作为全局知识库复用，但项目记忆和会话历史必须隔离；删除项目时应该清理项目数据和语义记忆，但保留全局资产。
+
+A - Action：
+数据库模型中将 Project、ChatSession、Todo、ResearchRun、WorkingMemoryItem、EpisodicMemoryItem、SemanticMemoryFact 绑定 project_id 或 session_id。Asset 独立作为全局资产。删除项目时清理项目关联数据和语义记忆向量，但不删除 Asset。运行时通过 ensure_next_sequence 限制同一会话 sequence_id 必须连续，避免并发或乱序写入污染历史。
+
+R - Result：
+测试验证了跨项目 TODO 会被拒绝、项目删除后全局资产仍保留、项目记忆被隔离、第二个会话不能读取第一个会话的 working memory。这个边界设计让系统既能复用资料，又能保证项目上下文准确。
+
+面试讲法：
+我把资产和项目记忆分开建模。资产是全局知识库，可以被多个项目复用；记忆是项目级和会话级状态，必须隔离。这个设计让删除项目不会误删资料，也避免不同项目的历史互相污染。
+
+
+十四、STAR 12：测试和工程化
+
+S - Situation：
+AI 应用经常依赖外部 LLM、向量库和网络工具，测试不稳定。如果每次测试都真实调用模型和外部 API，会导致慢、贵、不可重复。
+
+T - Task：
+需要构建可重复的自动化测试，让核心业务逻辑在本地不依赖真实 LLM、Qdrant 或外部工具也能验证。
+
+A - Action：
+测试中使用 sqlite 数据库、stub vector store、stub semantic memory store 和 monkeypatch 替换外部调用。使用 httpx.ASGITransport 直接测试 FastAPI app，不需要启动真实服务器。对 LLM planner、Agent next step、live tool、direct fallback、MinIO/Redis 上传组件都做 fake 实现。
+
+R - Result：
+当前测试覆盖 33 个用例，包括端到端项目会话、三层记忆、断点续传、Plan-and-Solve replan、live tool routing、Agent 多工具循环、LATS 搜索树、流式事件和前端 markdown 安全渲染。测试可以快速验证核心行为，不依赖真实外部服务。
+
+面试讲法：
+我没有把测试建立在真实 LLM 或外部 API 上，而是把模型、向量库、工具都 stub 掉，只验证自己的编排逻辑和数据契约。这样测试稳定，也能覆盖 Agent/LATS 这些复杂路径。
+
+
+十五、技术选型总表
+
+FastAPI：
+选择原因：轻量、类型友好、Pydantic schema 集成好，适合快速实现 API、流式接口和本地工作区服务。
+
+Pydantic：
+选择原因：所有 context、plan、retrieval、answer、memory、upload status 都能结构化建模，利于测试、前端消费和接口文档生成。
+
+SQLAlchemy + MySQL：
+选择原因：项目、会话、TODO、运行记录和记忆都是关系型实体，需要事务、外键和 JSON payload 持久化。MySQL 适合本地栈和后续生产化。
+
+Qdrant：
+选择原因：本地部署简单，支持向量集合、payload、过滤和语义检索，适合知识分块和语义记忆两个 collection。
+
+BGE-M3：
+选择原因：适合中英文混合语义检索，能服务论文、中文笔记、代码说明等资料。
+
+BM25 + jieba：
+选择原因：弥补 dense retrieval 对精确标题、作者、实体和中文关键词的漏召回问题。
+
+BGE reranker：
+选择原因：把粗召回和精排序分开，提升最终引用证据的相关性。
+
+Plan-and-Solve：
+选择原因：默认研究任务需要稳定、可解释、可测试的固定管线，而不是每次都开放式工具探索。
+
+LATS/MCTS：
+选择原因：处理工具路径不确定的问题，用搜索树比较候选动作，并能从失败路径恢复；作为可选增强模式，承担比默认管线更复杂但成本更高的任务。
+
+Redis bitmap：
+选择原因：天然适合记录上传分片是否完成，空间小、查询缺失分片方便。
+
+MinIO：
+选择原因：本地对象存储，兼容 S3 思路，适合存分片、合并对象和未来迁移。
+
+NDJSON Streaming：
+选择原因：实现简单，前端可逐行解析 JSON 事件，适合实时展示 plan、trace、trace_tree 和 answer_delta。
+
+
+十六、面试高频问题回答模板
+
+问题 1：为什么不用纯 ReAct，而是先做 Plan-and-Solve？
+回答：
+因为我的默认场景是项目资料研究，不是开放域闲聊。用户通常需要基于本地资产得到可引用答案，所以最稳定的流程是先明确目标，再检索证据，再校验证据，最后综合答案和写入记忆。Plan-and-Solve 能把这些阶段固定下来，执行轨迹更清楚，也更容易测试。ReAct/Agent 我保留为可选能力，用于多工具问题。
+
+问题 2：为什么还要做 LATS？
+回答：
+Plan-and-Solve 是单一路径，适合稳定 RAG；LATS 适合路径不确定的场景。比如一个问题可能要联网，也可能本地资料里已有答案；或者公开搜索失败后需要回到本地 RAG。LATS 用 MCTS 搜索工具决策树，比较多个候选动作的 value，最后选择 best path。它成本更高，所以我把它做成可选模式，而不是默认模式。
+
+问题 3：LATS 和 RAG 的关系是什么？
+回答：
+LATS 不是一种检索算法，在这个项目里它搜索的是 Agent 工具决策路径。RAG 是 LATS 可调用的一个工具 local_rag_search。LATS 可以在 local_rag_search、public_web_search、weather_lookup、memory_read、calculator 等工具之间做路径选择。
+
+问题 4：你的记忆怎么做的？
+回答：
+我把记忆分成三层：working 记录当前会话最近轮次，解决短期追问；episodic 记录项目级研究事件，解决跨会话历史回顾；semantic 抽取长期事实、决策、偏好和开放问题，写入 MySQL 和 Qdrant，用语义检索召回。构建 prompt 时三层分开注入，这样既能复用历史，又能避免所有对话简单拼接造成噪声。
+
+问题 5：如何避免记忆污染？
+回答：
+working memory 绑定 session_id，只在当前会话召回；episodic 和 semantic 绑定 project_id，只在当前项目召回。测试里验证了第二个会话看不到第一个会话 working memory，但能看到项目长期记忆；跨项目也不会读取其他项目的记忆。
+
+问题 6：为什么用 hybrid retrieval？
+回答：
+论文和项目资料里既有语义问题，也有精确实体问题。dense embedding 适合语义相似，但可能漏掉精确标题和作者；BM25 + jieba 适合关键词和中文分词；reranker 再做最终排序。这个组合比单一向量检索更适合中文研究资料。
+
+问题 7：断点续传怎么保证正确性？
+回答：
+前端先算文件 MD5，服务端以 MD5 作为 upload_id。Redis hash 保存上传元信息，Redis bitmap 标记每个分片是否完成；前端恢复时只上传 missing_chunks。MinIO 合并后服务端重新计算 MD5，只有和 upload_id 一致才会解析文件并创建资产。
+
+问题 8：如果没有 LLM key，系统还能跑吗？
+回答：
+可以。配置里支持 LLM_API_KEY 为空，此时系统使用 deterministic fallback 摘要和 stub provider 测试路径，保证项目、上传、检索、记忆和运行历史闭环仍然可跑。测试也主要基于 stub 和 monkeypatch，避免依赖真实外部服务。
+
+问题 9：如何解释答案可信度？
+回答：
+每次 answer 都带 quality report，包括 evidence_count、citation_count、grounded、fallback_used、signals、gaps、next_actions。比如没有检索证据就会标记 no_retrieved_evidence，引用和证据匹配才会增加 grounded 评分。这样前端和后续评测可以直接消费结构化质量指标。
+
+
+十七、可以放进简历的短 bullet
+
+- 从 0 到 1 开发本地优先 AI 研究工作台，集成项目/会话/资产/TODO/运行历史/分层记忆，支持文本、Markdown、PDF 导入和带引用回答。
+- 设计 Plan-and-Solve 默认执行管线，结构化输出 context、plan、retrieval、answer、memory 和 trace_id，实现可复盘的研究问答闭环。
+- 实现 hybrid RAG 检索链路，结合 Qdrant + BGE-M3 dense embedding、BM25 + jieba 词法召回和 BGE reranker 精排，提升中文资料和精确实体查询召回效果。
+- 设计 working、episodic、semantic 三层记忆系统，实现会话短期追问、项目级历史回顾和长期语义事实召回，并通过 project_id/session_id 保证记忆隔离。
+- 实现 LATS/MCTS Agent 模式，将 RAG、公开搜索、天气、记忆、资产、TODO、计算器等能力抽象为工具，搜索多步工具决策树并输出 best path 和 trace tree。
+- 实现浏览器 MD5 + Redis bitmap + MinIO compose 的断点续传上传链路，支持缺失分片恢复、重复文件复用、合并后 MD5 校验和自动资产索引。
+- 构建 answer quality report，将证据数量、引用一致性、fallback、执行失败和后续建议结构化，提升 AI 答案的可观测性和可调试性。
+- 使用 pytest + ASGITransport + stub vector store + monkeypatch 搭建稳定测试体系，覆盖 Plan-and-Solve、Agent、LATS、记忆隔离、实时工具、流式事件和上传链路。
+
+
+十八、建议在简历中保守量化的表述
+
+可以写：
+- 覆盖 30+ 个自动化测试用例。
+- 支持 1GB 级别可配置断点续传上传。
+- 支持 3 种执行模式：Plan-and-Solve、Agent Loop、LATS/MCTS。
+- 支持 3 层记忆：working、episodic、semantic。
+- 支持 8 类 research skill/tool 能力。
+
+不建议写：
+- 不要写线上用户量、准确率提升百分比、延迟降低百分比，除非后续真实压测或上线后有数据。
+- 不要写“完全防止幻觉”，更准确的说法是“通过引用、质量评估和 fallback 标记降低不可观测风险”。
+- 不要写“生产级大规模系统”，当前更准确是“本地优先 MVP/原型，具备生产化扩展结构”。

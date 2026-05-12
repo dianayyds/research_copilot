@@ -1,0 +1,139 @@
+Research Copilot Query Rewrite Benchmark
+Date: 2026-05-08
+
+1. Implementation Summary
+
+This change adds a structured Query Rewrite layer before local RAG retrieval. It does not replace the user query used for routing, memory, persistence, or answer synthesis. The original query is retained as the first retrieval query, and rewrite variants are used only as additional weighted retrieval queries.
+
+Implemented strategies:
+- baseline_expansion: keeps the previous planned_search_queries behavior.
+- standalone: resolves short or pronoun-heavy queries into a standalone retrieval query.
+- step_back: generates a higher-level abstract query for principles, architecture, tradeoffs, or taxonomy.
+- lexical_domain_expansion: combines tokenized sparse keywords with domain terms.
+- hyde: generates a HyDE-style hypothetical answer/document query for dense retrieval.
+
+Drift controls:
+- Query variants have weights. Original/baseline queries keep weight 1.0; abstract and HyDE queries are lower-weight recall boosters.
+- Lookup/taxonomy queries do not use HyDE, so author/title/category questions remain precise.
+- R-DeepSC semantic-noise taxonomy and robustness queries are separated to avoid pulling in unrelated DeepSC low-SNR chunks.
+- Live tools, memory writes, TODO creation, and calculator routing continue to use the raw user query.
+
+Main changed paths:
+- backend/app/models.py: QueryRewriteVariant and QueryRewriteResponse schemas.
+- backend/app/services.py: rewrite generation, weighted retrieval merge, Plan-and-Solve/Agent/LATS local RAG integration.
+- backend/app/config.py, .env.example, docker-compose.yml, README.md, README.zh-CN.md: runtime config.
+- backend/tests/test_query_rewrite.py: rewrite regression tests and semantic-communication benchmark.
+
+
+2. Benchmark Setup
+
+Corpus:
+- 8 synthetic semantic-communication assets.
+- 20 chunks total: 17 gold chunks and 3 distractor chunks covering:
+  - semantic communication vs Shannon communication
+  - DeepSC text semantic communication
+  - R-DeepSC semantic noise and robustness
+  - DeepSC-ST speech tasks
+  - task-oriented semantic communication and edge inference
+  - DIB/DDIB and selective retransmission
+  - high-speed semantic speech transmission, superimposed pilot, SwitchAC-SIP
+  - future 6G semantic-native architecture, multimodal trends, security/privacy
+  - distractors: Shannon capacity, Semantic Web, ordinary ASR
+
+Question set:
+- 15 main semantic-communication questions.
+- 6 paraphrase questions for stability.
+- Topics include architecture, technology choices, robustness, metrics, compression, high-speed channels, future trends, and distractor suppression.
+
+Metrics:
+- hit@1/hit@3/hit@5: whether any gold chunk appears in top-k.
+- MRR@5: reciprocal rank of the first gold chunk.
+- coverage@5: fraction of required gold chunks covered by top-5.
+- avg_rank: average first gold rank.
+- rank_stdev: lower means retrieval rank is more stable.
+- drift_rate: top-1 landing on a distractor chunk.
+
+
+3. Strategy-Level Results
+
+| Strategy | hit@1 | hit@3 | hit@5 | MRR@5 | coverage@5 | avg gold rank | rank stdev | drift rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 0.800 | 0.933 | 1.000 | 0.869 | 0.967 | 1.467 | 1.087 | 0.133 |
+| step_back | 0.867 | 1.000 | 1.000 | 0.922 | 1.000 | 1.200 | 0.542 | 0.067 |
+| hyde | 0.933 | 1.000 | 1.000 | 0.967 | 1.000 | 1.067 | 0.249 | 0.067 |
+| hybrid_3 | 0.933 | 1.000 | 1.000 | 0.967 | 1.000 | 1.067 | 0.249 | 0.067 |
+| hybrid_full | 0.933 | 1.000 | 1.000 | 0.967 | 1.000 | 1.067 | 0.249 | 0.067 |
+
+Key comparison against baseline:
+- hit@1 improved from 0.800 to 0.933.
+- MRR@5 improved from 0.869 to 0.967.
+- coverage@5 improved from 0.967 to 1.000.
+- average first gold rank improved from 1.467 to 1.067.
+- rank stdev improved from 1.087 to 0.249.
+- drift_rate dropped from 0.133 to 0.067.
+- hit@5 stayed at 1.000, so rewrite did not lose top-5 recall.
+- The 3-query hybrid setting produced the same main metrics as hybrid_full, so the headline gain is not dependent on simply using more queries than baseline.
+
+
+4. Paraphrase Stability Results
+
+| Strategy | hit@1 | hit@3 | hit@5 | MRR@5 | coverage@5 | avg gold rank | rank stdev | drift rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 0.833 | 1.000 | 1.000 | 0.917 | 0.583 | 1.167 | 0.373 | 0.000 |
+| hybrid_full | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 0.000 | 0.000 |
+
+Interpretation:
+- The strongest gain is paraphrase stability. The baseline often finds one relevant chunk but misses supporting chunks under paraphrasing. Hybrid rewrite keeps top-5 recall and improves coverage from 0.583 to 1.000.
+
+
+5. Per-Question Baseline vs Hybrid Full
+
+| ID | baseline rank | hybrid rank | baseline MRR | hybrid MRR | baseline coverage | hybrid coverage | baseline top-1 | hybrid top-1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Q1 | 2 | 2 | 0.500 | 0.500 | 1.000 | 1.000 | 干扰资料 · DIST-SHANNON-01 传统信道容量 | 干扰资料 · DIST-SHANNON-01 传统信道容量 |
+| Q2 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | 语义通信总览 · SC-METRIC-01 评价指标变化 | 语义通信总览 · SC-METRIC-01 评价指标变化 |
+| Q3 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | DeepSC 文本语义通信 · DSC-SNR-01 低信噪比鲁棒性 | DeepSC 文本语义通信 · DSC-SNR-01 低信噪比鲁棒性 |
+| Q4 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | DeepSC 文本语义通信 · DSC-METRIC-01 Sentence similarity | DeepSC 文本语义通信 · DSC-METRIC-01 Sentence similarity |
+| Q5 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | R-DeepSC 鲁棒语义通信 · RDSC-NOISE-01 Semantic noise 分类 | R-DeepSC 鲁棒语义通信 · RDSC-NOISE-01 Semantic noise 分类 |
+| Q6 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | R-DeepSC 鲁棒语义通信 · RDSC-ROBUST-01 抵抗语义噪声机制 | R-DeepSC 鲁棒语义通信 · RDSC-ROBUST-01 抵抗语义噪声机制 |
+| Q7 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | DeepSC-ST 语音语义通信 · ST-TASK-01 语音任务 | DeepSC-ST 语音语义通信 · ST-TASK-01 语音任务 |
+| Q8 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | 任务导向语义通信 · TOC-EDGE-01 多设备边缘推理 | 任务导向语义通信 · TOC-IB-01 DIB DDIB Tradeoff |
+| Q9 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | 任务导向语义通信 · TOC-IB-01 DIB DDIB Tradeoff | 任务导向语义通信 · TOC-IB-01 DIB DDIB Tradeoff |
+| Q10 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | 任务导向语义通信 · TOC-SR-01 Selective retransmission | 任务导向语义通信 · TOC-SR-01 Selective retransmission |
+| Q11 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | 高速语义语音传输 · HS-SIP-01 Superimposed pilot | 高速语义语音传输 · HS-SIP-01 Superimposed pilot |
+| Q12 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | 高速语义语音传输 · HS-SWITCH-01 SwitchAC-SIP | 高速语义语音传输 · HS-SWITCH-01 SwitchAC-SIP |
+| Q13 | 5 | 1 | 0.200 | 1.000 | 0.500 | 1.000 | 任务导向语义通信 · TOC-SR-01 Selective retransmission | 任务导向语义通信 · TOC-IB-01 DIB DDIB Tradeoff |
+| Q14 | 3 | 1 | 0.333 | 1.000 | 1.000 | 1.000 | 干扰资料 · DIST-ASR-01 普通 ASR | 语义通信总览 · SC-DEF-01 语义通信目标 |
+| Q15 | 1 | 1 | 1.000 | 1.000 | 1.000 | 1.000 | 语义通信未来趋势 · FUTURE-ARCH-01 语义原生网络 | 语义通信未来趋势 · FUTURE-ARCH-01 语义原生网络 |
+
+Important improvements:
+- Q13 improved from rank 5 to rank 1 by adding compression/HyDE/domain terms such as semantic compression, redundant bits, meaning recovery, information bottleneck, and rate-relevance tradeoff.
+- Q14 improved from rank 3 to rank 1 and suppressed an ASR distractor by adding a semantic-communication definition-oriented rewrite.
+
+Remaining note:
+- Q1 still has a Shannon distractor at top-1 because the query explicitly asks about Shannon communication and the distractor chunk is strongly lexical. The gold chunk remains rank 2 in both baseline and rewrite. Drift rate still improves overall because Q14 is fixed.
+
+
+6. Limitations
+
+- This benchmark supports a narrow claim: Query Rewrite improves retrieval stability on the current synthetic semantic-communication benchmark.
+- It does not prove broad cross-domain superiority. The corpus is small, synthetic, and focused on one technical domain.
+- The benchmark and rewrite rules are in the same repository, so there is some overfitting risk.
+- Most main questions were already strong under baseline; the largest main-set gains come from Q13 and Q14. The strongest overall evidence is the paraphrase set, where rewrite improves coverage and rank stability.
+- Future validation should run the same metrics on real uploaded papers/notes and additional domains such as codebase QA, project planning, and general literature review.
+
+
+7. Verification
+
+Commands run:
+- python3 -m compileall backend/app
+- python3 -m pytest backend/tests/test_query_rewrite.py -q
+- python3 -m pytest backend/tests -q
+
+Latest full test result:
+- 37 passed in 8.91s
+
+
+8. Resume Sentence
+
+引入 Query Rewrite 层，在保留原始问题的基础上融合 standalone rewrite、Step-back 抽象查询、HyDE 假想文档和领域词扩展，并用查询权重控制抽象 query 的漂移风险；在语义通信合成 RAG benchmark 中，相比原 planned_search_queries baseline，hybrid rewrite 在不降低 hit@5 的前提下将 hit@1 从 0.80 提升到 0.93，MRR@5 从 0.869 提升到 0.967，coverage@5 提升到 1.00，并将 distractor drift rate 从 0.133 降到 0.067。

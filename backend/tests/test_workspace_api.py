@@ -821,7 +821,7 @@ async def test_weather_query_uses_live_tool_router(monkeypatch: pytest.MonkeyPat
 
     def fake_execute_live_tool(route, query: str) -> LiveToolResult:
         assert route.tool_name == "weather_lookup"
-        assert "北京" in query
+        assert query == "今天北京的天气如何？"
         return LiveToolResult(
             answer="北京当前天气：晴。\n气温 20°C，体感 19°C。\n数据来源：测试天气工具。",
             evidence=[
@@ -852,6 +852,8 @@ async def test_weather_query_uses_live_tool_router(monkeypatch: pytest.MonkeyPat
     assert response.status_code == 200
     payload = response.json()
     assert payload["plan"]["planner_mode"] == "tool_router"
+    assert payload["plan"]["search_queries"] == ["今天北京的天气如何？"]
+    assert payload["plan"]["query_rewrite"]["variants"] == []
     assert "skill=weather_qa" in payload["plan"]["plan_summary"]
     assert "tool=weather_lookup" in payload["plan"]["plan_summary"]
     assert payload["retrieval"]["retrieval_mode"] == "live_tool"
@@ -1039,6 +1041,7 @@ async def test_agent_loop_uses_local_rag_then_creates_todo(monkeypatch: pytest.M
     assert actions.count("agent_action") == 3
     assert actions.count("agent_observation") == 2
     assert actions[-1] == "agent_final"
+    assert any("Query Rewrite" in step["summary"] for step in payload["plan"]["execution_trace"])
     assert any(todo["title"] == "梳理 Agent 工具注册表" and todo["priority"] == "high" for todo in todos.json())
 
 
@@ -1097,6 +1100,7 @@ async def test_agent_loop_uses_public_web_tool(monkeypatch: pytest.MonkeyPatch) 
     assert payload["retrieval"]["evidence_items"][0]["source_path"].startswith("https://api-docs.deepseek.com")
     assert "function calling" in payload["answer"]["answer"]
     assert any("public_web_search" in step["title"] for step in payload["plan"]["execution_trace"])
+    assert all("Query Rewrite" not in step["summary"] for step in payload["plan"]["execution_trace"])
 
 
 async def test_agent_loop_uses_calculator_and_memory_tools(monkeypatch: pytest.MonkeyPatch) -> None:

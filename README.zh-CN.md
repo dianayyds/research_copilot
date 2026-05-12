@@ -137,6 +137,10 @@ docker compose --profile llm up -d
 | `QDRANT_COLLECTION` | `knowledge_chunks` | 知识分块集合名 |
 | `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | 语义记忆集合名 |
 | `EXECUTION_MODE` | `plan_and_solve` | 执行模式 |
+| `QUERY_REWRITE_ENABLED` | `true` | 是否启用混合 Query Rewrite 检索扩展 |
+| `QUERY_REWRITE_HYDE_ENABLED` | `true` | 是否生成 HyDE 假想答案文档查询 |
+| `QUERY_REWRITE_STEP_BACK_ENABLED` | `true` | 是否生成 Step-back 抽象查询 |
+| `QUERY_REWRITE_MAX_QUERIES` | `10` | 单轮本地 RAG 最多使用的重写/扩展查询数 |
 | `UPLOAD_MAX_BYTES` | `104857600` | 文件上传大小上限，单位字节 |
 | `RESUMABLE_UPLOAD_MAX_BYTES` | `1073741824` | 断点续传上传大小上限，单位字节 |
 | `RESUMABLE_UPLOAD_CHUNK_SIZE` | `8388608` | 前端分片上传默认分片大小 |

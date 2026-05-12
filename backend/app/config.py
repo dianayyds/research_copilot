@@ -53,6 +53,20 @@ class Settings(BaseModel):
     reranker_batch_size: int = int(os.getenv("RERANKER_BATCH_SIZE", "2"))
     reranker_max_length: int = int(os.getenv("RERANKER_MAX_LENGTH", "512"))
     execution_mode: str = os.getenv("EXECUTION_MODE", "plan_and_solve")
+    query_rewrite_enabled: bool = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    query_rewrite_hyde_enabled: bool = os.getenv("QUERY_REWRITE_HYDE_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    query_rewrite_step_back_enabled: bool = os.getenv("QUERY_REWRITE_STEP_BACK_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    query_rewrite_max_queries: int = int(os.getenv("QUERY_REWRITE_MAX_QUERIES", "10"))
     retrieval_limit: int = int(os.getenv("RETRIEVAL_LIMIT", "5"))
     retrieval_candidate_limit: int = int(os.getenv("RETRIEVAL_CANDIDATE_LIMIT", "16"))
     asset_chunk_size: int = int(os.getenv("ASSET_CHUNK_SIZE", "500"))

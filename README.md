@@ -137,6 +137,10 @@ Important variables:
 | `QDRANT_COLLECTION` | `knowledge_chunks` | Chunk collection name |
 | `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | Semantic memory collection name |
 | `EXECUTION_MODE` | `plan_and_solve` | Runtime execution mode |
+| `QUERY_REWRITE_ENABLED` | `true` | Enable hybrid Query Rewrite retrieval expansion |
+| `QUERY_REWRITE_HYDE_ENABLED` | `true` | Generate HyDE hypothetical-answer document queries |
+| `QUERY_REWRITE_STEP_BACK_ENABLED` | `true` | Generate Step-back abstract queries |
+| `QUERY_REWRITE_MAX_QUERIES` | `10` | Max rewritten/expanded queries per local RAG turn |
 | `UPLOAD_MAX_BYTES` | `104857600` | Max uploaded file size in bytes |
 | `RESUMABLE_UPLOAD_MAX_BYTES` | `1073741824` | Max resumable upload file size in bytes |
 | `RESUMABLE_UPLOAD_CHUNK_SIZE` | `8388608` | Browser chunk size for resumable uploads |

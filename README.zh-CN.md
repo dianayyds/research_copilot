@@ -16,6 +16,25 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 
 后端同时提供 API 和前端工作区，因此本地部署比较直接。
 
+## 简历摘要
+
+简介：传统科研工作面临资料碎片化与过程不可复盘问题。本项目构建面向私有项目知识库的 AI 研究工作台，集成资料导入、Hybrid RAG 检索、引用回答、运行轨迹和分层记忆，为用户提供可追溯、可复用的个性化研究辅助。
+
+技术栈：FastAPI、Pydantic、SQLAlchemy、MySQL、Redis、MinIO、Qdrant、BGE-M3、BGE Reranker、BM25、jieba、DeepSeek API、Docker Compose、pytest。
+
+- 实现基于 Qdrant + BGE-M3 + BM25/jieba + BGE Reranker 的 Hybrid RAG 检索链路，融合语义检索、关键词检索、RRF 排序和 rerank 精排，为回答生成提供可追溯 citation 证据。
+- 引入 Query Rewrite 检索增强层，支持 standalone query、Step-back 抽象查询、HyDE 假设性文档和领域词扩展；在语义通信 benchmark 中将 hit@1 从 0.80 提升至 0.93，MRR@5 从 0.869 提升至 0.967。
+- 设计 working / episodic / semantic 三层记忆体系：working 保存会话内近期问答，episodic 记录项目级研究事件，semantic 抽取事实、决策、开放问题和偏好，并结合向量检索支持长期语义召回。
+- 实现 Plan-and-Solve 主控的 Agent 执行链路，在规划阶段拆解研究目标，在执行阶段引入 ReAct 式工具调用完成检索、观察、校验和答案综合，实现复杂研究问答过程可追踪、结果可复盘。
+
+实验扩展：
+
+- 基于 Qwen3-0.6B + LoRA + TRL 完成 SFT + DPO 后训练实验，用于 Agent 工具调用决策对齐；在分层 held-out eval 上将 JSON 有效率 46.7% 提升至 100%，action accuracy 26.7% 提升至 86.7%，tool-needed F1 47.1% 提升至 100%。详见 [SFT + DPO Tool-Use Alignment Report](docs/sft-dpo-tool-use-report.md)。
+
+扩展规划：
+
+- 计划基于 LazyRegistry 自动发现 skill manifest 并按需懒加载 handler；结合 Progressive Disclosure 渐进式暴露机制，先向模型提供工具摘要完成路由，再注入候选工具 schema 生成结构化参数，降低 token 开销和误调用风险。
+
 ## 主页面预览
 
 ![Research Copilot 主页面与 Agent 执行轨迹](docs/images/main-page-agent-trace.png)
@@ -242,6 +261,7 @@ curl http://127.0.0.1:8001/healthz
 - [技术亮点](docs/technical-highlights.md)
 - [MVP 路线图](docs/mvp-roadmap.md)
 - [源码映射](docs/source-mapping.md)
+- [SFT + DPO 工具调用对齐实验](docs/sft-dpo-tool-use-report.md)
 - [工作流契约](specs/workflows/research-copilot.yaml)
 
 ## License

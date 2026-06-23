@@ -16,6 +16,25 @@ The current MVP is built around a fixed `plan-and-solve` runtime:
 
 The backend serves both the API and the workspace UI, which keeps local deployment simple.
 
+## Resume Highlights
+
+Research Copilot targets the fragmentation and poor traceability of traditional research workflows. It provides a private-project knowledge workspace that combines asset ingestion, Hybrid RAG retrieval, cited answers, execution traces, and layered memory to make research assistance reusable and auditable.
+
+Tech stack: FastAPI, Pydantic, SQLAlchemy, MySQL, Redis, MinIO, Qdrant, BGE-M3, BGE Reranker, BM25, jieba, DeepSeek API, Docker Compose, and pytest.
+
+- Built a Hybrid RAG pipeline with Qdrant, BGE-M3, BM25/jieba, and BGE Reranker, combining dense retrieval, lexical search, RRF fusion, and reranking to produce citation-grounded evidence for answer generation.
+- Added Query Rewrite retrieval expansion with standalone queries, Step-back abstraction, HyDE hypothetical documents, and domain keyword expansion; on a semantic-communication benchmark, hit@1 improved from 0.80 to 0.93 and MRR@5 from 0.869 to 0.967.
+- Designed a working / episodic / semantic memory system: working memory stores recent session turns, episodic memory records project-level research events, and semantic memory extracts facts, decisions, open questions, and preferences for long-term vector recall.
+- Implemented a Plan-and-Solve controlled Agent flow: planning decomposes the research objective, while the execution stage uses a ReAct-style tool loop for retrieval, observation, validation, and answer synthesis, making complex research QA traceable and replayable.
+
+Experimental extension:
+
+- Ran a Qwen3-0.6B + LoRA + TRL SFT + DPO tool-use alignment experiment for Agent tool decision tuning. On a stratified held-out eval, JSON validity improved from 46.7% to 100%, action accuracy from 26.7% to 86.7%, and tool-needed F1 from 47.1% to 100%. See [SFT + DPO Tool-Use Alignment Report](docs/sft-dpo-tool-use-report.md).
+
+Planned extension:
+
+- A LazyRegistry-based skill system can dynamically discover skill manifests and lazily load handlers on demand. Combined with Progressive Disclosure, the runtime can first expose concise tool summaries for routing and then inject detailed schemas only for candidate tools, reducing token overhead and miscall risk.
+
 ## Workspace Preview
 
 ![Research Copilot workspace with Agent execution trace](docs/images/main-page-agent-trace.png)
@@ -242,6 +261,7 @@ curl http://127.0.0.1:8001/healthz
 - [Technical Highlights](docs/technical-highlights.md)
 - [Source Mapping](docs/source-mapping.md)
 - [MVP Roadmap](docs/mvp-roadmap.md)
+- [SFT + DPO Tool-Use Alignment Report](docs/sft-dpo-tool-use-report.md)
 - [Workflow Contract](specs/workflows/research-copilot.yaml)
 
 ## License

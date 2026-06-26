@@ -10,7 +10,6 @@ const state = {
   streamingRun: null,
   assets: [],
   assetDrawerOpen: false,
-  latsMode: false,
 };
 
 const sessionListEl = document.getElementById("session-list");
@@ -21,7 +20,6 @@ const composerForm = document.getElementById("composer-form");
 const composerQueryEl = document.getElementById("composer-query");
 const composerSubmitEl = document.getElementById("composer-submit");
 const planSolveModeToggleEl = document.getElementById("plan-solve-mode-toggle");
-const latsModeToggleEl = document.getElementById("lats-mode-toggle");
 const newSessionButton = document.getElementById("new-session-button");
 const assetToggleButton = document.getElementById("asset-toggle-button");
 const assetCloseButton = document.getElementById("asset-close-button");
@@ -160,23 +158,14 @@ function nextSequenceId() {
 }
 
 function runModeLabel() {
-  if (state.latsMode) {
-    return "LATS Agent";
-  }
   return "Plan-and-Solve Agent";
 }
 
 function plannerModeForStreamingRun() {
-  if (state.latsMode) {
-    return "lats_agent_mcts";
-  }
   return "two_stage";
 }
 
 function runPathForMode() {
-  if (state.latsMode) {
-    return "lats/run/stream";
-  }
   return "run/stream";
 }
 
@@ -202,7 +191,6 @@ function setSubmitting(isSubmitting) {
   composerQueryEl.disabled = isSubmitting;
   composerSubmitEl.disabled = isSubmitting;
   planSolveModeToggleEl.disabled = isSubmitting;
-  latsModeToggleEl.disabled = isSubmitting;
   composerSubmitEl.innerHTML = `<span>${isSubmitting ? "…" : "↑"}</span>`;
 }
 
@@ -222,8 +210,7 @@ function renderHeader() {
   const session = selectedSession();
   chatTitleEl.textContent = session ? session.title : "新对话";
   sequenceHintEl.textContent = `${runModeLabel()} · 下一轮 #${nextSequenceId()}`;
-  planSolveModeToggleEl.checked = !state.latsMode;
-  latsModeToggleEl.checked = state.latsMode;
+  planSolveModeToggleEl.checked = true;
 }
 
 function renderSessions() {
@@ -304,55 +291,6 @@ function renderCitations(citations) {
   `;
 }
 
-function formatScore(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number.toFixed(2) : "0.00";
-}
-
-function renderTraceTreeNode(node) {
-  const children = node.children || [];
-  const depth = Math.max(0, Number(node.depth) || 0);
-  const action = node.action || "root";
-  const skill = node.skill || "";
-  const summary = node.observation_summary || node.reflection || node.thought || "";
-  const args = node.arguments && Object.keys(node.arguments).length ? JSON.stringify(node.arguments) : "";
-  return `
-    <div class="trace-tree-node ${node.best_path ? "best-path" : ""} ${node.terminal ? "terminal-node" : ""}" style="--tree-depth: ${depth}">
-      <div class="trace-tree-main">
-        <span class="trace-tree-action">${escapeHtml(action)}</span>
-        ${skill ? `<span class="trace-tree-skill">${escapeHtml(skill)}</span>` : ""}
-        <span class="trace-tree-metric">score ${formatScore(node.score)}</span>
-        <span class="trace-tree-metric">visits ${escapeHtml(node.visits || 0)}</span>
-        ${node.best_path ? '<span class="trace-tree-best">best</span>' : ""}
-      </div>
-      <div class="trace-tree-detail">
-        ${summary ? `<span>${escapeHtml(summary)}</span>` : ""}
-        ${args ? `<code>${escapeHtml(args)}</code>` : ""}
-      </div>
-    </div>
-    ${children.map((child) => renderTraceTreeNode(child)).join("")}
-  `;
-}
-
-function renderTraceTree(traceTree) {
-  if (!traceTree || !traceTree.root) {
-    return "";
-  }
-  const bestActions = traceTree.best_actions?.length ? traceTree.best_actions.join(" → ") : "未选择";
-  return `
-    <div class="trace-tree">
-      <div class="trace-tree-header">
-        <strong>Agent 搜索树</strong>
-        <span>${escapeHtml(traceTree.iterations || 0)} iter · ${escapeHtml(traceTree.node_count || 0)} nodes</span>
-      </div>
-      <div class="trace-tree-path">best path: ${escapeHtml(bestActions)}</div>
-      <div class="trace-tree-list">
-        ${renderTraceTreeNode(traceTree.root)}
-      </div>
-    </div>
-  `;
-}
-
 function renderExecutionTrace(run) {
   const plan = run.plan || {};
   const steps = plan.execution_trace || [];
@@ -369,7 +307,6 @@ function renderExecutionTrace(run) {
         <div class="thinking-state">${escapeHtml(replanLabel)}</div>
       </div>
       <div class="thinking-plan">${escapeHtml(planSummary || "正在规划执行路径…")}</div>
-      ${renderTraceTree(plan.trace_tree)}
       ${
         steps.length
           ? `
@@ -560,7 +497,6 @@ function createStreamingRun(query, sessionId, sequenceId) {
       plan_summary: "",
       tasks: [],
       execution_trace: [],
-      trace_tree: {},
       solver_summary: "",
       replan_count: 0,
       replan_reason: "",
@@ -638,9 +574,6 @@ async function runTurn(query) {
       if (event.type === "trace" && event.step) {
         state.streamingRun.plan.execution_trace = [...state.streamingRun.plan.execution_trace, event.step];
       }
-      if (event.type === "trace_tree" && event.trace_tree) {
-        state.streamingRun.plan.trace_tree = event.trace_tree;
-      }
       if (event.type === "solver_summary") {
         state.streamingRun.plan.solver_summary = event.solver_summary || "";
         state.streamingRun.plan.replan_count = event.replan_count || 0;
@@ -678,12 +611,6 @@ assetToggleButton.addEventListener("click", () => {
 });
 
 planSolveModeToggleEl.addEventListener("change", () => {
-  state.latsMode = false;
-  renderHeader();
-});
-
-latsModeToggleEl.addEventListener("change", () => {
-  state.latsMode = true;
   renderHeader();
 });
 

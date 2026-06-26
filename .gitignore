@@ -15,6 +15,17 @@ venv/
 # Local model assets
 models/
 
+# Local runtime state
+data/
+.codex
+
+# Local SFT/DPO experiment artifacts
+experiments/tool_use_alignment/data/
+experiments/tool_use_alignment/outputs/
+experiments/tool_use_alignment/reports/
+experiments/tool_use_alignment/**/*.safetensors
+experiments/tool_use_alignment/**/*.bin
+
 # Test and type-check caches
 .pytest_cache/
 .mypy_cache/

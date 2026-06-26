@@ -234,7 +234,6 @@ class PlanTasksResponse(BaseModel):
     solver_summary: str = ""
     replan_count: int = 0
     replan_reason: str = ""
-    trace_tree: dict[str, Any] = Field(default_factory=dict)
     generated_at: str = Field(default_factory=utc_now)
 
 

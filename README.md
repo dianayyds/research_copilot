@@ -27,10 +27,6 @@ Tech stack: FastAPI, Pydantic, SQLAlchemy, MySQL, Redis, MinIO, Qdrant, BGE-M3, 
 - Designed a working / episodic / semantic memory system: working memory stores recent session turns, episodic memory records project-level research events, and semantic memory extracts facts, decisions, open questions, and preferences for long-term vector recall.
 - Implemented a Plan-and-Solve controlled Agent flow: planning decomposes the research objective, while the execution stage uses a ReAct-style tool loop for retrieval, observation, validation, and answer synthesis, making complex research QA traceable and replayable.
 
-Experimental extension:
-
-- Ran a Qwen3-0.6B + LoRA + TRL SFT + DPO tool-use alignment experiment for Agent tool decision tuning. On a stratified held-out eval, JSON validity improved from 46.7% to 100%, action accuracy from 26.7% to 86.7%, and tool-needed F1 from 47.1% to 100%. See [SFT + DPO Tool-Use Alignment Report](docs/sft-dpo-tool-use-report.md).
-
 Planned extension:
 
 - A LazyRegistry-based skill system can dynamically discover skill manifests and lazily load handlers on demand. Combined with Progressive Disclosure, the runtime can first expose concise tool summaries for routing and then inject detailed schemas only for candidate tools, reducing token overhead and miscall risk.
@@ -39,11 +35,11 @@ Planned extension:
 
 ![Research Copilot workspace with Agent execution trace](docs/images/main-page-agent-trace.png)
 
-The main workspace keeps conversation, project assets, and run history in one screen. The left sidebar provides quick access to new chats, assets, and recent sessions, while the center panel shows the current conversation. When Agent mode is enabled, the answer area includes a step-by-step execution trace so you can inspect tool choices such as local RAG search, public search, memory, TODO, asset listing, and calculation before the final response.
+The main workspace keeps conversation, project assets, and run history in one screen. The left sidebar provides quick access to new chats, assets, and recent sessions, while the center panel shows the current conversation. The answer area includes a step-by-step execution trace so you can inspect evidence retrieval, tool calls, observations, and answer synthesis before the final response.
 
 ## Current Capabilities
 
-- Project CRUD with dashboard summaries
+- Project CRUD with summary counts
 - Text, Markdown, and PDF asset creation, editing, and upload
 - Resumable chunked asset uploads with browser-side MD5, Redis bitmap progress, and MinIO chunk compose
 - TODO CRUD and direct TODO execution
@@ -51,9 +47,9 @@ The main workspace keeps conversation, project assets, and run history in one sc
 - Local reranking for evidence ordering
 - Cited answer generation
 - Live/public-information tool routing, with weather questions routed to an external weather tool
-- Optional LATS Agent/MCTS mode for searching tool-decision paths across RAG, web, weather, memory, assets, TODOs, calculator, and final answers
+- Plan-Act-Observe Agent mode for structured tool calls across RAG, web, weather, memory, assets, TODOs, and calculator
 - Research-oriented skill/tool registry with read-only and side-effect risk metadata
-- Agent/LATS trace tree visualization for decision replay and best-path inspection
+- Agent execution-trace visualization for replaying tool choices, observations, and answer synthesis
 - Layered memory with working, episodic, and semantic recall
 - Run history and detailed execution traces
 - Browser workspace served from the same FastAPI app
@@ -169,9 +165,6 @@ Important variables:
 | `LLM_TOOL_PLANNER_ENABLED` | `true` | Let the LLM choose live tools before falling back to rules |
 | `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | Timeout for one LLM tool-planning call |
 | `AGENT_MAX_STEPS` | `5` | Max Plan-Act-Observe steps for `/agent/run` |
-| `LATS_BRANCHING_FACTOR` | `4` | Max candidate agent actions expanded per LATS node |
-| `LATS_MAX_DEPTH` | `2` | Max Agent decision-tree depth for LATS |
-| `LATS_ITERATIONS` | `6` | MCTS iteration budget for `/lats/run` |
 | `PUBLIC_WEB_SEARCH_ENABLED` | `true` | Allow explicit web/search questions to call public search tools |
 | `LIVE_TOOL_TIMEOUT_SECONDS` | `8.0` | Timeout for one external tool call |
 | `DATABASE_URL` | empty | Optional override for MySQL connection string |
@@ -187,11 +180,14 @@ Key endpoints:
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
 | `/healthz` | `GET` | Service health and dependency summary |
-| `/api/v1/config/providers` | `GET` | Active provider configuration |
-| `/api/v1/dashboard` | `GET` | Project and run dashboard |
 | `/api/v1/projects` | `GET`, `POST` | List or create projects |
 | `/api/v1/projects/{project_id}` | `GET`, `PATCH`, `DELETE` | Manage a project |
-| `/api/v1/projects/{project_id}/assets` | `GET`, `POST` | List or create project assets |
+| `/api/v1/projects/{project_id}/sessions` | `GET`, `POST` | List or create project chat sessions |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/run` | `POST` | Execute one research run |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/run/stream` | `POST` | Stream one research run as NDJSON events |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/agent/run` | `POST` | Execute one Plan-Act-Observe Agent run |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/runs` | `GET` | List session run history |
+| `/api/v1/assets` | `GET`, `POST` | List or create global assets |
 | `/api/v1/assets/upload-file` | `POST` | Legacy single-request upload for `.txt`, `.md`, `.markdown`, `.pdf` |
 | `/api/v1/assets/uploads/init` | `POST` | Create or resume an MD5-addressed chunked upload |
 | `/api/v1/assets/uploads/{upload_id}/chunks` | `POST` | Upload one file chunk and mark its Redis bitmap bit |
@@ -199,15 +195,12 @@ Key endpoints:
 | `/api/v1/assets/{asset_id}` | `PATCH`, `DELETE` | Update or delete one asset |
 | `/api/v1/projects/{project_id}/todos` | `GET`, `POST` | List or create TODOs |
 | `/api/v1/todos/{todo_id}` | `PATCH`, `DELETE` | Update or delete one TODO |
-| `/api/v1/projects/{project_id}/run` | `POST` | Execute one research run |
-| `/api/v1/projects/{project_id}/runs` | `GET` | List run history |
 | `/api/v1/projects/{project_id}/memory` | `GET` | List layered memory records |
-| `/api/v1/runtime/research/run` | `POST` | Direct runtime pipeline endpoint |
 
 ### Example: Upload A Text Asset
 
 ```bash
-curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-text \
+curl -X POST http://127.0.0.1:8001/api/v1/assets/upload-file \
   -F "asset_type=note" \
   -F "title=system-notes.txt" \
   -F "file=@./system-notes.txt"
@@ -216,10 +209,11 @@ curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-te
 ### Example: Run Research
 
 ```bash
-curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/run \
+curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/sessions/<session_id>/run \
   -H "Content-Type: application/json" \
   -d '{
     "user_query": "Summarize the relationship between the paper and the codebase",
+    "sequence_id": 1,
     "asset_ids": []
   }'
 ```
@@ -258,10 +252,6 @@ curl http://127.0.0.1:8001/healthz
 
 - [Architecture](docs/architecture.md)
 - [User Manual](docs/user-manual.md)
-- [Technical Highlights](docs/technical-highlights.md)
-- [Source Mapping](docs/source-mapping.md)
-- [MVP Roadmap](docs/mvp-roadmap.md)
-- [SFT + DPO Tool-Use Alignment Report](docs/sft-dpo-tool-use-report.md)
 - [Workflow Contract](specs/workflows/research-copilot.yaml)
 
 ## License

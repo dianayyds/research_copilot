@@ -27,10 +27,6 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 - 设计 working / episodic / semantic 三层记忆体系：working 保存会话内近期问答，episodic 记录项目级研究事件，semantic 抽取事实、决策、开放问题和偏好，并结合向量检索支持长期语义召回。
 - 实现 Plan-and-Solve 主控的 Agent 执行链路，在规划阶段拆解研究目标，在执行阶段引入 ReAct 式工具调用完成检索、观察、校验和答案综合，实现复杂研究问答过程可追踪、结果可复盘。
 
-实验扩展：
-
-- 基于 Qwen3-0.6B + LoRA + TRL 完成 SFT + DPO 后训练实验，用于 Agent 工具调用决策对齐；在分层 held-out eval 上将 JSON 有效率 46.7% 提升至 100%，action accuracy 26.7% 提升至 86.7%，tool-needed F1 47.1% 提升至 100%。详见 [SFT + DPO Tool-Use Alignment Report](docs/sft-dpo-tool-use-report.md)。
-
 扩展规划：
 
 - 计划基于 LazyRegistry 自动发现 skill manifest 并按需懒加载 handler；结合 Progressive Disclosure 渐进式暴露机制，先向模型提供工具摘要完成路由，再注入候选工具 schema 生成结构化参数，降低 token 开销和误调用风险。
@@ -39,11 +35,11 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 
 ![Research Copilot 主页面与 Agent 执行轨迹](docs/images/main-page-agent-trace.png)
 
-主页面把对话、项目资产和运行历史放在同一个工作区里。左侧栏用于新建对话、查看资产和切换最近会话，中间区域展示当前问答。当勾选 Agent 模式时，回答区域会显示逐步执行轨迹，方便查看系统如何选择本地 RAG、公开搜索、记忆、TODO、资产列表或计算器等工具，并最终生成回答。
+主页面把对话、项目资产和运行历史放在同一个工作区里。左侧栏用于新建对话、查看资产和切换最近会话，中间区域展示当前问答。回答区域会显示逐步执行轨迹，方便查看系统如何检索证据、调用工具、整理观察结果并最终生成回答。
 
 ## 当前能力
 
-- 项目 CRUD 和仪表盘概览
+- 项目 CRUD 和汇总计数
 - 文本、Markdown 和 PDF 资产的创建、编辑与上传
 - 支持浏览器 MD5、Redis bitmap 进度和 MinIO 分片合并的断点续传上传
 - TODO 的创建、编辑、删除和直接执行
@@ -51,9 +47,9 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 - 本地 reranker 对证据做最终排序
 - 带引用回答生成
 - 实时/公开信息工具路由，天气类问题优先调用外部天气工具
-- 可选 LATS Agent/MCTS 模式，用于在 RAG、联网、天气、记忆、资产、TODO、计算器和最终回答之间搜索工具决策路径
+- Plan-Act-Observe Agent 模式，可在 RAG、联网、天气、记忆、资产、TODO 和计算器之间进行结构化工具调用
 - 面向研究场景的 skill/tool registry，包含只读/副作用风险元数据
-- Agent/LATS 搜索树可视化，用于回放决策过程和检查最佳路径
+- Agent 执行轨迹可视化，用于回放工具选择、观察结果和答案综合过程
 - working、episodic、semantic 三层记忆
 - 运行历史和详细执行结果查看
 - 由同一个 FastAPI 服务直接提供浏览器工作区
@@ -169,9 +165,6 @@ docker compose --profile llm up -d
 | `LLM_TOOL_PLANNER_ENABLED` | `true` | 是否让 LLM 先决定实时工具，再回退规则 |
 | `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | 单次 LLM 工具规划调用超时时间 |
 | `AGENT_MAX_STEPS` | `5` | `/agent/run` 的 Plan-Act-Observe 最大步数 |
-| `LATS_BRANCHING_FACTOR` | `4` | LATS 每个节点最多展开的候选 Agent 动作数 |
-| `LATS_MAX_DEPTH` | `2` | LATS Agent 决策树最大深度 |
-| `LATS_ITERATIONS` | `6` | `/lats/run` 的 MCTS 迭代预算 |
 | `PUBLIC_WEB_SEARCH_ENABLED` | `true` | 是否允许显式联网/搜索类问题调用公开搜索工具 |
 | `LIVE_TOOL_TIMEOUT_SECONDS` | `8.0` | 单次外部工具调用超时时间 |
 | `DATABASE_URL` | 空 | 可选，用于覆盖默认 MySQL 连接串 |
@@ -187,11 +180,14 @@ Swagger UI 地址是 `/docs`。
 | 接口 | 方法 | 作用 |
 | --- | --- | --- |
 | `/healthz` | `GET` | 服务状态和依赖概览 |
-| `/api/v1/config/providers` | `GET` | 当前 provider 配置 |
-| `/api/v1/dashboard` | `GET` | 项目和运行仪表盘 |
 | `/api/v1/projects` | `GET`, `POST` | 查询或创建项目 |
 | `/api/v1/projects/{project_id}` | `GET`, `PATCH`, `DELETE` | 管理单个项目 |
-| `/api/v1/projects/{project_id}/assets` | `GET`, `POST` | 查询或创建项目资产 |
+| `/api/v1/projects/{project_id}/sessions` | `GET`, `POST` | 查询或创建项目会话 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/run` | `POST` | 执行一次研究任务 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/run/stream` | `POST` | 以 NDJSON 事件流执行研究任务 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/agent/run` | `POST` | 执行一次 Plan-Act-Observe Agent 任务 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/runs` | `GET` | 查看会话运行历史 |
+| `/api/v1/assets` | `GET`, `POST` | 查询或创建全局资产 |
 | `/api/v1/assets/upload-file` | `POST` | 旧版单请求上传 `.txt`、`.md`、`.markdown`、`.pdf` |
 | `/api/v1/assets/uploads/init` | `POST` | 按 MD5 创建或恢复分片上传 |
 | `/api/v1/assets/uploads/{upload_id}/chunks` | `POST` | 上传单个分片，并写入 Redis bitmap |
@@ -199,15 +195,12 @@ Swagger UI 地址是 `/docs`。
 | `/api/v1/assets/{asset_id}` | `PATCH`, `DELETE` | 更新或删除单个资产 |
 | `/api/v1/projects/{project_id}/todos` | `GET`, `POST` | 查询或创建 TODO |
 | `/api/v1/todos/{todo_id}` | `PATCH`, `DELETE` | 更新或删除单个 TODO |
-| `/api/v1/projects/{project_id}/run` | `POST` | 执行一次研究任务 |
-| `/api/v1/projects/{project_id}/runs` | `GET` | 查看运行历史 |
 | `/api/v1/projects/{project_id}/memory` | `GET` | 查看分层记忆记录 |
-| `/api/v1/runtime/research/run` | `POST` | 直接调用运行时管线 |
 
 ### 示例：上传文本资产
 
 ```bash
-curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-text \
+curl -X POST http://127.0.0.1:8001/api/v1/assets/upload-file \
   -F "asset_type=note" \
   -F "title=system-notes.txt" \
   -F "file=@./system-notes.txt"
@@ -216,10 +209,11 @@ curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-te
 ### 示例：执行研究任务
 
 ```bash
-curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/run \
+curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/sessions/<session_id>/run \
   -H "Content-Type: application/json" \
   -d '{
     "user_query": "请总结论文与代码仓之间的关系",
+    "sequence_id": 1,
     "asset_ids": []
   }'
 ```
@@ -258,10 +252,6 @@ curl http://127.0.0.1:8001/healthz
 
 - [系统架构](docs/architecture.md)
 - [用户手册](docs/user-manual.md)
-- [技术亮点](docs/technical-highlights.md)
-- [MVP 路线图](docs/mvp-roadmap.md)
-- [源码映射](docs/source-mapping.md)
-- [SFT + DPO 工具调用对齐实验](docs/sft-dpo-tool-use-report.md)
 - [工作流契约](specs/workflows/research-copilot.yaml)
 
 ## License

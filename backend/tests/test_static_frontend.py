@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
+
+import pytest
 
 
 def test_assistant_markdown_renderer_converts_bold_and_escapes_html() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for static frontend renderer tests")
+
     app_js = Path(__file__).parents[1] / "app" / "static" / "app.js"
     source = app_js.read_text(encoding="utf-8")
     functions = source[source.index("function escapeHtml") : source.index("function formatTime")]
@@ -25,6 +32,6 @@ def test_assistant_markdown_renderer_converts_bold_and_escapes_html() -> None:
         + "if (!output.includes('<code>code</code>')) throw new Error(output);\n"
     )
 
-    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
 
     assert result.returncode == 0, result.stderr or result.stdout

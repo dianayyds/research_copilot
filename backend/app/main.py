@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from time import perf_counter
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
@@ -59,6 +59,7 @@ from app.services import (
     list_todos,
     project_to_response,
     skill_tool_registry_payload,
+    run_long_term_memory_maintenance,
     stream_agent_events,
     stream_research_events,
     init_resumable_asset_upload,
@@ -257,10 +258,13 @@ async def create_and_run_endpoint(
     project_id: str,
     session_id: str,
     payload: ResearchTurnRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> ResearchRunDetailResponse:
     try:
-        return create_and_run(db, project_id, session_id, payload)
+        result = create_and_run(db, project_id, session_id, payload)
+        background_tasks.add_task(run_long_term_memory_maintenance, project_id, session_id, payload.sequence_id)
+        return result
     except ValueError as exc:
         detail = str(exc)
         status_code = 404 if "not found" in detail.lower() else 400
@@ -310,10 +314,13 @@ async def create_agent_and_run_endpoint(
     project_id: str,
     session_id: str,
     payload: ResearchTurnRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> ResearchRunDetailResponse:
     try:
-        return create_agent_and_run(db, project_id, session_id, payload)
+        result = create_agent_and_run(db, project_id, session_id, payload)
+        background_tasks.add_task(run_long_term_memory_maintenance, project_id, session_id, payload.sequence_id)
+        return result
     except ValueError as exc:
         detail = str(exc)
         status_code = 404 if "not found" in detail.lower() else 400

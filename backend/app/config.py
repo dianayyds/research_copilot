@@ -46,13 +46,16 @@ class Settings(BaseModel):
     embedding_dimension: int = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
     embedding_batch_size: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "4"))
     embedding_max_length: int = int(os.getenv("EMBEDDING_MAX_LENGTH", "2048"))
+    pdf_parser_provider: str = os.getenv("PDF_PARSER_PROVIDER", "auto")
+    grobid_api_base: str = os.getenv("GROBID_API_BASE", "")
+    grobid_timeout_seconds: float = float(os.getenv("GROBID_TIMEOUT_SECONDS", "20.0"))
     reranker_provider: str = os.getenv("RERANKER_PROVIDER", "local")
     reranker_model: str = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
     reranker_model_dir: Path = Path(os.getenv("RERANKER_MODEL_DIR", "/models"))
     reranker_device: str = os.getenv("RERANKER_DEVICE", "cpu")
     reranker_batch_size: int = int(os.getenv("RERANKER_BATCH_SIZE", "2"))
-    reranker_max_length: int = int(os.getenv("RERANKER_MAX_LENGTH", "512"))
-    execution_mode: str = os.getenv("EXECUTION_MODE", "plan_and_solve")
+    reranker_max_length: int = int(os.getenv("RERANKER_MAX_LENGTH", "1024"))
+    execution_mode: str = os.getenv("EXECUTION_MODE", "plan_react_mcp")
     query_rewrite_enabled: bool = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     query_rewrite_hyde_enabled: bool = os.getenv("QUERY_REWRITE_HYDE_ENABLED", "true").lower() in {
         "1",
@@ -70,7 +73,12 @@ class Settings(BaseModel):
     retrieval_limit: int = int(os.getenv("RETRIEVAL_LIMIT", "5"))
     retrieval_candidate_limit: int = int(os.getenv("RETRIEVAL_CANDIDATE_LIMIT", "16"))
     asset_chunk_size: int = int(os.getenv("ASSET_CHUNK_SIZE", "500"))
-    working_memory_limit: int = int(os.getenv("WORKING_MEMORY_LIMIT", "8"))
+    asset_parent_chunk_tokens: int = int(os.getenv("ASSET_PARENT_CHUNK_TOKENS", "1800"))
+    asset_child_chunk_tokens: int = int(os.getenv("ASSET_CHILD_CHUNK_TOKENS", "480"))
+    asset_child_chunk_overlap_tokens: int = int(os.getenv("ASSET_CHILD_CHUNK_OVERLAP_TOKENS", "80"))
+    asset_context_snippet_chars: int = int(os.getenv("ASSET_CONTEXT_SNIPPET_CHARS", "1600"))
+    working_memory_token_threshold: int = int(os.getenv("WORKING_MEMORY_TOKEN_THRESHOLD", "1200"))
+    working_memory_compaction_ratio: float = float(os.getenv("WORKING_MEMORY_COMPACTION_RATIO", "0.75"))
     episodic_memory_limit: int = int(os.getenv("EPISODIC_MEMORY_LIMIT", "4"))
     semantic_memory_limit: int = int(os.getenv("SEMANTIC_MEMORY_LIMIT", "6"))
     upload_max_bytes: int = int(os.getenv("UPLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
@@ -92,6 +100,24 @@ class Settings(BaseModel):
         "on",
     }
     live_tool_timeout_seconds: float = float(os.getenv("LIVE_TOOL_TIMEOUT_SECONDS", "8.0"))
+    plan_react_max_tasks: int = int(os.getenv("PLAN_REACT_MAX_TASKS", "6"))
+    plan_react_default_node_iterations: int = int(os.getenv("PLAN_REACT_DEFAULT_NODE_ITERATIONS", "4"))
+    plan_react_llm_timeout_seconds: float = float(os.getenv("PLAN_REACT_LLM_TIMEOUT_SECONDS", "60.0"))
+    mcp_enabled: bool = os.getenv("MCP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    mcp_github_enabled: bool = os.getenv("MCP_GITHUB_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    mcp_github_transport: str = os.getenv("MCP_GITHUB_TRANSPORT", "stdio")
+    mcp_github_command: str = os.getenv(
+        "MCP_GITHUB_COMMAND",
+        "docker run --rm -i -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server",
+    )
+    mcp_github_url: str = os.getenv("MCP_GITHUB_URL", "")
+    mcp_github_allowed_side_effect_tools: list[str] = _split_csv(
+        os.getenv("MCP_GITHUB_ALLOWED_SIDE_EFFECT_TOOLS", "")
+    )
+    github_personal_access_token: str = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+    mcp_protocol_version: str = os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18")
+    mcp_request_timeout_seconds: float = float(os.getenv("MCP_REQUEST_TIMEOUT_SECONDS", "30.0"))
+    mcp_initialize_timeout_seconds: float = float(os.getenv("MCP_INITIALIZE_TIMEOUT_SECONDS", "20.0"))
     cors_origins: list[str] = _split_csv(os.getenv("CORS_ORIGINS", "*"))
     database_url: str = os.getenv("DATABASE_URL", "")
     vector_store_provider: str = os.getenv("VECTOR_STORE_PROVIDER", "qdrant")

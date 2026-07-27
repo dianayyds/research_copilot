@@ -158,11 +158,11 @@ function nextSequenceId() {
 }
 
 function runModeLabel() {
-  return "Plan-and-Solve Agent";
+  return "Plan-ReAct MCP Agent";
 }
 
 function plannerModeForStreamingRun() {
-  return "two_stage";
+  return "plan_react_mcp";
 }
 
 function runPathForMode() {

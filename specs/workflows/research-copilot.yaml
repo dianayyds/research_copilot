@@ -42,11 +42,6 @@ nodes:
     runtime: python-runtime
     mode: parallel
 
-  - id: rank_evidence
-    type: runtime_api
-    action: rerank_evidence
-    runtime: python-runtime
-
   - id: synthesize_answer
     type: runtime_api
     action: answer_with_citations
@@ -72,9 +67,6 @@ edges:
     to: retrieve_evidence
 
   - from: retrieve_evidence
-    to: rank_evidence
-
-  - from: rank_evidence
     to: synthesize_answer
 
   - from: synthesize_answer

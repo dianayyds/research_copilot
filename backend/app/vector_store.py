@@ -118,6 +118,10 @@ def filter_chunks(chunks: list[dict[str, Any]], asset_ids: list[str]) -> list[di
     return [chunk for chunk in chunks if chunk["asset_id"] in allowed]
 
 
+def searchable_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [chunk for chunk in chunks if str(chunk.get("chunk_level", "child")) == "child"]
+
+
 def lexical_overlap_search(chunks: list[dict[str, Any]], query: str, limit: int) -> list[dict[str, Any]]:
     query_tokens = set(tokenize(query))
     ranked = []
@@ -181,7 +185,7 @@ class StubVectorStore:
         self.chunks.clear()
 
     def upsert_chunks(self, chunks: list[dict[str, str]]) -> None:
-        for chunk in chunks:
+        for chunk in searchable_chunks(chunks):
             self.chunks[chunk["chunk_id"]] = dict(chunk)
 
     def delete_asset(self, asset_id: str) -> None:
@@ -197,7 +201,7 @@ class StubVectorStore:
         asset_ids: list[str],
         chunks: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        corpus = filter_chunks(chunks or list(self.chunks.values()), asset_ids)
+        corpus = searchable_chunks(filter_chunks(chunks or list(self.chunks.values()), asset_ids))
         candidate_limit = hybrid_candidate_limit(limit)
         dense_hits = lexical_overlap_search(corpus, query, candidate_limit)
         sparse_hits = bm25_search(corpus, query, candidate_limit)
@@ -316,6 +320,7 @@ class QdrantVectorStore:
 
     def upsert_chunks(self, chunks: list[dict[str, str]]) -> None:
         self.ensure_collection()
+        chunks = searchable_chunks(chunks)
         if not chunks:
             return
         vectors = self.embedder.encode([chunk["content"] for chunk in chunks])
@@ -380,7 +385,7 @@ class QdrantVectorStore:
             with_payload=True,
             limit=limit,
         )
-        return [{**dict(hit.payload or {}), "score": float(hit.score)} for hit in response.points]
+        return searchable_chunks([{**dict(hit.payload or {}), "score": float(hit.score)} for hit in response.points])
 
     def rerank(self, query: str, hits: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
         passages = [f"{hit['title']}\n{hit['content']}" for hit in hits]
@@ -399,7 +404,7 @@ class QdrantVectorStore:
         chunks: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         candidate_limit = hybrid_candidate_limit(limit)
-        corpus = filter_chunks(chunks, asset_ids)
+        corpus = searchable_chunks(filter_chunks(chunks, asset_ids))
         if not corpus:
             return []
         dense_hits = self.dense_search(query, candidate_limit, asset_ids)

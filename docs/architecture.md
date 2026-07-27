@@ -3,15 +3,18 @@
 ## Overview
 
 The current system uses a single FastAPI service to host both the frontend
-workspace and the backend runtime. The runtime follows a `plan-and-solve`
-pipeline and persists project state in MySQL.
+workspace and the backend runtime. The default runtime follows a
+`plan_react_mcp` flow and persists project state in MySQL.
 
 ```mermaid
 flowchart LR
     UI[Browser Workspace] --> API[FastAPI Runtime API]
-    API --> PS[Plan-and-Solve Service]
-    PS --> RET[Local Hybrid Retrieval]
-    PS --> MEM[Memory Consolidation]
+    API --> PRM[Plan-ReAct MCP Runtime]
+    PRM --> LLM[DeepSeek Planner and ReAct Decisions]
+    PRM --> MCP[MCP JSON-RPC Client]
+    MCP --> GH[GitHub MCP Server]
+    PRM --> RET[Local Hybrid Retrieval / Legacy RAG]
+    PRM --> MEM[Memory Consolidation]
     API --> DB[(MySQL)]
     API --> REDIS[(Redis)]
     API --> MINIO[(MinIO)]
@@ -22,7 +25,8 @@ flowchart LR
 ## Backend Layers
 
 - `main.py`: HTTP routes, lifespan startup, static frontend mount
-- `services.py`: project CRUD, TODO workflow, run orchestration, retrieval, memory
+- `services.py`: project CRUD, TODO workflow, Plan-ReAct MCP orchestration, retrieval, memory
+- `mcp_client.py`: hand-written JSON-RPC MCP client over stdio, plus a Streamable HTTP skeleton
 - `db_models.py`: SQLAlchemy persistence model
 - `models.py`: request and response schemas
 - `static/`: browser workspace UI
@@ -42,9 +46,14 @@ sequenceDiagram
     U->>W: Run TODO
     W->>R: POST /projects/{id}/run
     R->>R: Build context
-    R->>R: Plan tasks
-    R->>R: Retrieve evidence
-    R->>R: Synthesize answer
+    R->>R: Initialize GitHub MCP client
+    R->>R: Ask DeepSeek for structured plan
+    loop Per plan node
+        R->>R: Ask DeepSeek for ReAct decision
+        R->>R: Execute allowed MCP action
+        R->>R: Record observation
+    end
+    R->>R: Synthesize cited answer
     R->>R: Update memory
     R->>D: Persist run + memory
     R-->>W: Return cited result
@@ -52,6 +61,7 @@ sequenceDiagram
 
 ## Notes
 
-- DeepSeek and local embedding providers are configuration targets, not yet active inference backends.
-- Retrieval currently uses open-source local components and project asset text.
+- Default `/run` and `/run/stream` require DeepSeek credentials and GitHub MCP credentials.
+- Local retrieval still uses open-source local components and project asset text, mainly for legacy RAG paths and local project tools.
 - The current frontend is backend-served to keep the deployment simple and reliable.
+- The local Docker Compose profile mounts `/var/run/docker.sock` so the runtime can launch the GitHub MCP server container; this is a high-privilege development setting.

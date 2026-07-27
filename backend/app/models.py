@@ -192,6 +192,9 @@ class ResearchTask(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     output_key: str = ""
     status: str = "pending"
+    success_criteria: str = ""
+    max_iterations: int = Field(default=4, ge=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PlanExecutionStep(BaseModel):
@@ -203,6 +206,7 @@ class PlanExecutionStep(BaseModel):
     status: str = "completed"
     search_queries: list[str] = Field(default_factory=list)
     evidence_labels: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class QueryRewriteVariant(BaseModel):
@@ -225,7 +229,7 @@ class PlanTasksResponse(BaseModel):
     project_id: str
     session_id: str
     sequence_id: int
-    planner_mode: str = "two_stage"
+    planner_mode: str = "plan_react_mcp"
     plan_summary: str = ""
     search_queries: list[str] = Field(default_factory=list)
     query_rewrite: QueryRewriteResponse = Field(default_factory=QueryRewriteResponse)

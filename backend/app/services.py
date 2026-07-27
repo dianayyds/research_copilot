@@ -4,13 +4,15 @@ import ast
 from io import BytesIO
 import logging
 import math
+import queue
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from time import perf_counter
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import httpx
 from sqlalchemy import desc, select
@@ -18,9 +20,17 @@ from sqlalchemy.orm import Session
 
 from app.asset_ingest import parse_uploaded_asset
 from app.config import settings
+from app.db import SessionLocal
 from app.db_models import Asset, ChatSession, Project, ResearchRun, Todo, WorkingMemoryItem
+from app.document_processing import ChunkRecord, build_asset_chunks
 from app.live_tools import LiveToolResult, LiveToolRoute, execute_live_tool, select_live_tool
-from app.memory_manager import build_memory_context_bundle, consolidate_layered_memories, list_layered_memories
+from app.memory_manager import (
+    build_memory_context_bundle,
+    consolidate_layered_memories,
+    consolidate_long_term_memories,
+    list_layered_memories,
+)
+from app.mcp_client import MCPClient, MCPError, create_github_mcp_client
 from app.models import (
     AnswerQualityReport,
     AnswerResponse,
@@ -36,6 +46,7 @@ from app.models import (
     ConsolidateMemoryRequest,
     ConsolidateMemoryResponse,
     EvidenceItem,
+    MemoryItem,
     MemoryRecordResponse,
     PlanExecutionStep,
     PlanTasksResponse,
@@ -102,16 +113,6 @@ MEMORY_STOP_TERMS = {
 logger = logging.getLogger("uvicorn.error")
 
 
-@dataclass
-class ChunkRecord:
-    asset_id: str
-    chunk_id: str
-    title: str
-    asset_type: str
-    content: str
-    source_path: str
-
-
 @dataclass(frozen=True)
 class ToolPlannerDecision:
     route: LiveToolRoute | None
@@ -157,6 +158,29 @@ class AgentToolObservation:
     metadata: dict[str, object]
 
 
+@dataclass(frozen=True)
+class PlanReactDecision:
+    thought: str
+    action: str
+    server: str
+    capability_type: str
+    name: str
+    arguments: dict[str, object]
+    is_done: bool = False
+    answer_fragment: str = ""
+
+
+@dataclass
+class PlanReactObservation:
+    server: str
+    capability_type: str
+    name: str
+    summary: str
+    content: str
+    metadata: dict[str, object]
+    status: str = "completed"
+
+
 def make_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
@@ -172,26 +196,6 @@ def compact_text(text: str, limit: int = 80) -> str:
 def slugify(text: str) -> str:
     normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "-", text.strip().lower())
     return normalized.strip("-")[:48] or "chunk"
-
-
-def split_chunks(text: str) -> list[str]:
-    paragraphs = [item.strip() for item in text.splitlines() if item.strip()]
-    joined = paragraphs or [text.strip()]
-    chunks: list[str] = []
-    current: list[str] = []
-    current_length = 0
-    for paragraph in joined:
-        next_length = current_length + len(paragraph)
-        if current and next_length > settings.asset_chunk_size:
-            chunks.append("\n".join(current))
-            current = [paragraph]
-            current_length = len(paragraph)
-            continue
-        current.append(paragraph)
-        current_length = next_length
-    if current:
-        chunks.append("\n".join(current))
-    return chunks
 
 
 def markdown_sections(text: str) -> list[tuple[str, str]]:
@@ -414,23 +418,7 @@ def build_chunks(assets: list[Asset], asset_ids: list[str]) -> list[ChunkRecord]
     selected_assets = [asset for asset in assets if not allowed or asset.id in allowed]
     chunks: list[ChunkRecord] = []
     for asset in selected_assets:
-        section_index = 0
-        for heading, body in markdown_sections(asset.content):
-            for chunk_index, chunk_text in enumerate(split_chunks(body), start=1):
-                section_index += 1
-                heading_slug = slugify(heading)
-                source_path = f"/assets/{asset.id}#{heading_slug}" if heading != "正文" else f"/assets/{asset.id}"
-                display_title = asset.title if heading == "正文" else f"{asset.title} · {heading}"
-                chunks.append(
-                    ChunkRecord(
-                        asset_id=asset.id,
-                        chunk_id=f"{asset.id}-{heading_slug}-{section_index:03d}-{chunk_index:03d}",
-                        title=display_title,
-                        asset_type=asset.asset_type,
-                        content=chunk_text,
-                        source_path=source_path,
-                    )
-                )
+        chunks.extend(build_asset_chunks(asset))
     return chunks
 
 
@@ -443,6 +431,12 @@ def chunk_payloads(assets: list[Asset], asset_ids: list[str]) -> list[dict[str, 
             "asset_type": chunk.asset_type,
             "content": chunk.content,
             "source_path": chunk.source_path,
+            "chunk_level": chunk.chunk_level,
+            "parent_id": chunk.parent_id,
+            "section_path": chunk.section_path,
+            "page_start": str(chunk.page_start),
+            "page_end": str(chunk.page_end),
+            "token_count": str(chunk.token_count),
         }
         for chunk in build_chunks(assets, asset_ids)
     ]
@@ -630,6 +624,28 @@ def total_chunks_for(file_size: int, chunk_size: int) -> int:
     return max(1, math.ceil(file_size / chunk_size))
 
 
+def validate_resumable_upload_resume(
+    upload_id: str,
+    meta: dict[str, str],
+    *,
+    file_md5: str,
+    file_size: int,
+) -> None:
+    mismatches: list[str] = []
+    if meta.get("file_md5") and meta["file_md5"] != file_md5:
+        mismatches.append("file_md5")
+    try:
+        existing_size = int(meta.get("file_size", ""))
+    except ValueError as exc:
+        raise ValueError(f"Upload {upload_id} metadata is invalid; restart the upload") from exc
+    if existing_size != file_size:
+        mismatches.append("file_size")
+    if mismatches:
+        raise ValueError(
+            f"Upload {upload_id} metadata does not match requested file: {', '.join(mismatches)}"
+        )
+
+
 def resumable_upload_status(
     db: Session,
     upload_id: str,
@@ -673,7 +689,9 @@ def init_resumable_asset_upload(
     upload_id = file_md5
     store = get_upload_progress_store()
     existing = store.get_meta(upload_id)
-    if not existing:
+    if existing:
+        validate_resumable_upload_resume(upload_id, existing, file_md5=file_md5, file_size=payload.file_size)
+    else:
         now = utc_now().isoformat()
         store.save_meta(
             upload_id,
@@ -1385,6 +1403,40 @@ def merge_retrieval_hits(hit_groups: list[tuple[str, list[dict[str, object]], fl
     return ranked[:limit]
 
 
+def centered_context(parent_content: str, child_content: str, limit: int) -> str:
+    clean_parent = " ".join(parent_content.split())
+    clean_child = " ".join(child_content.split())
+    if len(clean_parent) <= limit:
+        return clean_parent
+    pivot = clean_parent.find(clean_child[: max(min(len(clean_child), 160), 40)])
+    if pivot < 0:
+        return clean_parent[:limit].strip()
+    start = max(pivot - (limit // 3), 0)
+    end = min(start + limit, len(clean_parent))
+    start = max(end - limit, 0)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(clean_parent) else ""
+    return f"{prefix}{clean_parent[start:end].strip()}{suffix}"
+
+
+def expand_child_hit_context(hit: dict[str, object], payload_by_id: dict[str, dict[str, str]]) -> dict[str, object]:
+    parent_id = str(hit.get("parent_id") or "")
+    parent = payload_by_id.get(parent_id)
+    if not parent:
+        return {**hit, "context_content": str(hit.get("content", ""))}
+    context = centered_context(
+        str(parent.get("content", "")),
+        str(hit.get("content", "")),
+        settings.asset_context_snippet_chars,
+    )
+    return {
+        **hit,
+        "context_content": context,
+        "parent_title": parent.get("title", hit.get("title", "")),
+        "parent_source_path": parent.get("source_path", hit.get("source_path", "")),
+    }
+
+
 def plan_text(tasks: list[ResearchTask]) -> str:
     lines = []
     for index, task in enumerate(tasks, start=1):
@@ -1436,7 +1488,7 @@ def build_context(
         "- no prior turns yet",
         limit=900,
     )
-    working_context = context_excerpt(memory_bundle.working_text, "- no working memory yet", limit=1000)
+    working_context = memory_bundle.working_text
     episodic_context = context_excerpt(memory_bundle.episodic_text, "- no episodic memory yet", limit=1200)
     semantic_context = context_excerpt(memory_bundle.semantic_text, "- no semantic memory yet", limit=1200)
     asset_scope = asset_scope_summary(assets)
@@ -1568,18 +1620,27 @@ def hybrid_retrieve(
         for search_query in (search_queries or [request.user_query])
     ]
     ranked = merge_retrieval_hits(query_hits, settings.retrieval_limit)
+    payload_by_id = {str(chunk["chunk_id"]): chunk for chunk in payloads}
+    expanded = [expand_child_hit_context(chunk, payload_by_id) for chunk in ranked]
     evidence_items = [
         EvidenceItem(
             asset_id=str(chunk["asset_id"]),
             chunk_id=str(chunk["chunk_id"]),
             label=f"C{index}",
-            title=str(chunk["title"]),
-            snippet=str(chunk["content"])[:320],
-            source_path=str(chunk["source_path"]),
+            title=str(chunk.get("parent_title") or chunk["title"]),
+            snippet=str(chunk.get("context_content") or chunk["content"]),
+            source_path=str(chunk.get("parent_source_path") or chunk["source_path"]),
             score=round(float(chunk["score"]), 4),
-            tags=[str(chunk["asset_type"]), "plan", "hybrid", "reranked", compact_text(str(chunk["matched_query"]), 48)],
+            tags=[
+                str(chunk["asset_type"]),
+                "plan",
+                "hybrid",
+                "child-reranked",
+                "parent-context",
+                compact_text(str(chunk["matched_query"]), 48),
+            ],
         )
-        for index, chunk in enumerate(ranked, start=1)
+        for index, chunk in enumerate(expanded, start=1)
     ]
     return RetrieveResponse(
         project_id=request.project_id,
@@ -2340,6 +2401,598 @@ def agent_should_use_direct_llm_fallback(
     if observations and all(isinstance(item.get("metadata"), dict) and item["metadata"].get("error") for item in observations):
         return True
     return False
+
+
+def create_plan_react_mcp_client() -> MCPClient:
+    return create_github_mcp_client()
+
+
+def limited_json(value: object, limit: int = 1600) -> str:
+    return compact_text(json.dumps(value, ensure_ascii=False, default=str), limit)
+
+
+def mcp_list_capability(client: MCPClient, method_name: str) -> list[dict[str, Any]]:
+    try:
+        if method_name == "tools":
+            return client.list_tools()
+        if method_name == "resources":
+            return client.list_resources()
+        if method_name == "prompts":
+            return client.list_prompts()
+    except MCPError as exc:
+        logger.warning("mcp_list_capability_failed server=%s method=%s error=%s", client.config.name, method_name, exc)
+    return []
+
+
+def mcp_catalog_payload(client: MCPClient) -> dict[str, object]:
+    tools = mcp_list_capability(client, "tools")
+    resources = mcp_list_capability(client, "resources")
+    prompts = mcp_list_capability(client, "prompts")
+    return {
+        "servers": [
+            {
+                "name": client.config.name,
+                "transport": client.config.transport,
+                "server_info": client.server_info,
+                "tools": tools,
+                "resources": resources,
+                "prompts": prompts,
+            }
+        ]
+    }
+
+
+def mcp_catalog_prompt(catalog: dict[str, object]) -> str:
+    servers = catalog.get("servers") or []
+    summaries = []
+    server_iter = servers if isinstance(servers, list) else []
+    for server in server_iter:
+        if not isinstance(server, dict):
+            continue
+        summaries.append(
+            {
+                "name": server.get("name"),
+                "tools": [
+                    {
+                        "name": item.get("name"),
+                        "description": compact_text(str(item.get("description") or ""), 180),
+                        "inputSchema": item.get("inputSchema") or item.get("input_schema") or {},
+                        "annotations": item.get("annotations") or {},
+                    }
+                    for item in (server.get("tools") or [])[:30]
+                    if isinstance(item, dict)
+                ],
+                "resources": [
+                    {
+                        "uri": item.get("uri"),
+                        "name": item.get("name"),
+                        "description": compact_text(str(item.get("description") or ""), 160),
+                        "mimeType": item.get("mimeType"),
+                    }
+                    for item in (server.get("resources") or [])[:30]
+                    if isinstance(item, dict)
+                ],
+                "prompts": [
+                    {
+                        "name": item.get("name"),
+                        "description": compact_text(str(item.get("description") or ""), 160),
+                        "arguments": item.get("arguments") or [],
+                    }
+                    for item in (server.get("prompts") or [])[:30]
+                    if isinstance(item, dict)
+                ],
+            }
+        )
+    return limited_json({"servers": summaries}, 6000)
+
+
+def llm_plan_react_plan(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    catalog: dict[str, object],
+) -> PlanTasksResponse:
+    if not llm_available():
+        raise ValueError("plan_react_mcp requires LLM_PROVIDER=deepseek and a non-empty LLM_API_KEY.")
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot 的 Plan-ReAct-MCP planner。"
+                        "只返回 JSON 对象，不要 Markdown。你要先输出计划，不要直接回答。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "请基于用户问题、项目上下文和 MCP 能力目录输出执行计划。\n\n"
+                        "JSON schema：{"
+                        '"plan_summary":"一句话计划",'
+                        '"tasks":[{"task_id":"task-1","title":"节点标题","goal":"节点目标",'
+                        '"success_criteria":"何时完成该节点","max_iterations":4}]}。\n\n'
+                        "约束：\n"
+                        f"- 最多 {settings.plan_react_max_tasks} 个任务。\n"
+                        f"- 每个任务 max_iterations 默认 {settings.plan_react_default_node_iterations}，范围 1-8。\n"
+                        "- 每个任务后续会独立执行 thought -> action -> observation 循环。\n"
+                        "- 如果问题需要 GitHub 信息，计划应使用 GitHub MCP 能力。\n\n"
+                        f"用户问题：{request.user_query}\n\n"
+                        f"项目上下文：\n{context.packed_context[:5000]}\n\n"
+                        f"MCP 能力目录：\n{mcp_catalog_prompt(catalog)}"
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1000,
+        },
+        timeout=settings.plan_react_llm_timeout_seconds,
+    )
+    response.raise_for_status()
+    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
+    tasks_payload = payload.get("tasks") or []
+    if not isinstance(tasks_payload, list) or not tasks_payload:
+        raise ValueError("Plan-ReAct planner did not return any tasks")
+    tasks: list[ResearchTask] = []
+    for index, item in enumerate(tasks_payload[: max(settings.plan_react_max_tasks, 1)], start=1):
+        if not isinstance(item, dict):
+            continue
+        max_iterations = item.get("max_iterations", settings.plan_react_default_node_iterations)
+        try:
+            max_iterations_int = max(1, min(8, int(max_iterations)))
+        except (TypeError, ValueError):
+            max_iterations_int = settings.plan_react_default_node_iterations
+        tasks.append(
+            ResearchTask(
+                task_id=str(item.get("task_id") or f"task-{index}"),
+                title=compact_text(str(item.get("title") or f"Plan node {index}"), 120),
+                goal=compact_text(str(item.get("goal") or request.user_query), 500),
+                task_type="plan_react_node",
+                depends_on=[f"task-{index - 1}"] if index > 1 else [],
+                output_key=f"node_{index}_result",
+                success_criteria=compact_text(str(item.get("success_criteria") or "节点观察足以支持最终回答。"), 500),
+                max_iterations=max_iterations_int,
+                metadata={"planner": "llm_plan_react_mcp"},
+            )
+        )
+    if not tasks:
+        raise ValueError("Plan-ReAct planner returned invalid tasks")
+    return PlanTasksResponse(
+        project_id=request.project_id,
+        session_id=request.session_id,
+        sequence_id=request.sequence_id,
+        planner_mode="plan_react_mcp",
+        plan_summary=compact_text(str(payload.get("plan_summary") or "先规划，再逐节点执行 ReAct + MCP。"), 500),
+        search_queries=[],
+        tasks=tasks,
+    )
+
+
+def plan_react_decision_from_payload(payload: dict[str, object]) -> PlanReactDecision:
+    arguments = payload.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return PlanReactDecision(
+        thought=compact_text(str(payload.get("thought") or ""), 500),
+        action=str(payload.get("action") or "").strip(),
+        server=str(payload.get("server") or "github").strip() or "github",
+        capability_type=str(payload.get("capability_type") or "").strip().lower(),
+        name=str(payload.get("name") or "").strip(),
+        arguments=dict(arguments),
+        is_done=planner_truthy(payload.get("is_done", False)),
+        answer_fragment=compact_text(str(payload.get("answer_fragment") or ""), 1200),
+    )
+
+
+def llm_plan_react_next_step(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    catalog: dict[str, object],
+    task: ResearchTask,
+    history: list[dict[str, object]],
+) -> PlanReactDecision:
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot 的 ReAct 执行器。只能返回 JSON 对象，不要 Markdown。"
+                        "每轮先简短 thought，再选择一个 MCP action 或结束当前节点。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "输出 JSON schema：{"
+                        '"thought":"简短思考",'
+                        '"action":"mcp_call|final_answer|stop",'
+                        '"server":"github",'
+                        '"capability_type":"tool|resource|prompt",'
+                        '"name":"工具名/资源URI/提示词名",'
+                        '"arguments":{},'
+                        '"is_done":false,'
+                        '"answer_fragment":"节点完成时的阶段性结论"}。\n\n'
+                        "规则：\n"
+                        "- 需要调用 MCP 时 action=mcp_call，并填写 capability_type/name/arguments。\n"
+                        "- resource 的 name 填 uri；prompt 的 name 填 prompt name。\n"
+                        "- 当前节点已经满足 success_criteria 时，is_done=true。\n"
+                        "- 每轮最多选择一个 action。\n\n"
+                        f"用户问题：{request.user_query}\n\n"
+                        f"当前节点：{task.model_dump(mode='json')}\n\n"
+                        f"项目上下文：\n{context.packed_context[:3000]}\n\n"
+                        f"MCP 能力目录：\n{mcp_catalog_prompt(catalog)}\n\n"
+                        f"已有 action/observation：\n{limited_json(history[-10:], 5000)}"
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 800,
+        },
+        timeout=settings.plan_react_llm_timeout_seconds,
+    )
+    response.raise_for_status()
+    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
+    if not isinstance(payload, dict):
+        raise ValueError("Plan-ReAct decision must be a JSON object")
+    return plan_react_decision_from_payload(payload)
+
+
+def mcp_tool_by_name(catalog: dict[str, object], server_name: str, tool_name: str) -> dict[str, object]:
+    for server in catalog.get("servers") or []:
+        if not isinstance(server, dict) or str(server.get("name")) != server_name:
+            continue
+        for tool in server.get("tools") or []:
+            if isinstance(tool, dict) and str(tool.get("name")) == tool_name:
+                return dict(tool)
+    return {}
+
+
+def mcp_tool_is_read_only(tool: dict[str, object], tool_name: str) -> bool:
+    annotations = tool.get("annotations") or {}
+    if isinstance(annotations, dict) and planner_truthy(annotations.get("readOnlyHint", False)):
+        return True
+    if planner_truthy(tool.get("readOnlyHint", False)):
+        return True
+    return tool_name.lower().startswith(("get", "list", "search", "read"))
+
+
+def side_effect_tool_allowed(tool_name: str) -> bool:
+    return tool_name in set(settings.mcp_github_allowed_side_effect_tools)
+
+
+def summarize_mcp_result(result: dict[str, Any]) -> str:
+    content = result.get("content")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if "text" in item:
+                parts.append(str(item.get("text") or ""))
+            elif "resource" in item:
+                parts.append(limited_json(item.get("resource"), 800))
+            else:
+                parts.append(limited_json(item, 800))
+        if parts:
+            return compact_text("\n".join(parts), 3000)
+    contents = result.get("contents")
+    if isinstance(contents, list):
+        parts = []
+        for item in contents:
+            if not isinstance(item, dict):
+                continue
+            parts.append(str(item.get("text") or item.get("blob") or limited_json(item, 800)))
+        if parts:
+            return compact_text("\n".join(parts), 3000)
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        return compact_text(limited_json(messages, 3000), 3000)
+    return limited_json(result, 3000)
+
+
+def execute_mcp_decision(
+    client: MCPClient,
+    catalog: dict[str, object],
+    decision: PlanReactDecision,
+) -> PlanReactObservation:
+    capability = decision.capability_type.rstrip("s")
+    server = decision.server or "github"
+    if server != client.config.name:
+        raise ValueError(f"Unsupported MCP server: {server}")
+    if capability == "tool":
+        tool = mcp_tool_by_name(catalog, server, decision.name)
+        read_only = mcp_tool_is_read_only(tool, decision.name)
+        if not read_only and not side_effect_tool_allowed(decision.name):
+            return PlanReactObservation(
+                server=server,
+                capability_type="tool",
+                name=decision.name,
+                summary=f"阻断有副作用 MCP tool：{decision.name}",
+                content=f"工具 {decision.name} 不是 read-only，且不在 MCP_GITHUB_ALLOWED_SIDE_EFFECT_TOOLS allowlist 中。",
+                metadata={"risk": "side_effect", "read_only": False, "blocked": True},
+                status="blocked",
+            )
+        result = client.call_tool(decision.name, decision.arguments)
+        return PlanReactObservation(
+            server=server,
+            capability_type="tool",
+            name=decision.name,
+            summary=f"调用 MCP tool：{decision.name}",
+            content=summarize_mcp_result(result),
+            metadata={"risk": "read_only" if read_only else "side_effect_allowed", "raw": result},
+        )
+    if capability == "resource":
+        uri = decision.name or str(decision.arguments.get("uri") or "")
+        result = client.read_resource(uri)
+        return PlanReactObservation(
+            server=server,
+            capability_type="resource",
+            name=uri,
+            summary=f"读取 MCP resource：{uri}",
+            content=summarize_mcp_result(result),
+            metadata={"risk": "read_only", "raw": result},
+        )
+    if capability == "prompt":
+        result = client.get_prompt(decision.name, decision.arguments)
+        return PlanReactObservation(
+            server=server,
+            capability_type="prompt",
+            name=decision.name,
+            summary=f"读取 MCP prompt：{decision.name}",
+            content=summarize_mcp_result(result),
+            metadata={"risk": "read_only", "raw": result},
+        )
+    raise ValueError(f"Unsupported MCP capability_type: {decision.capability_type}")
+
+
+def plan_react_evidence_item(
+    request: TurnScopedRequest,
+    observation: PlanReactObservation,
+    *,
+    index: int,
+    step_id: str,
+) -> EvidenceItem:
+    return EvidenceItem(
+        asset_id=f"mcp:{observation.server}",
+        chunk_id=f"{step_id}:{observation.capability_type}:{observation.name}",
+        label=f"C{index}",
+        title=f"{observation.server}.{observation.capability_type}:{observation.name}",
+        snippet=observation.content[:320],
+        source_path=f"mcp://{observation.server}/{observation.capability_type}/{observation.name}",
+        score=1.0,
+        tags=["mcp", observation.server, observation.capability_type, request.project_id],
+    )
+
+
+def llm_plan_react_final_answer(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    plan: PlanTasksResponse,
+    history: list[dict[str, object]],
+    evidence_items: list[EvidenceItem],
+) -> str:
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot。请基于 Plan-ReAct-MCP 的观察结果回答用户。"
+                        "如果引用 MCP observation，请使用 [C1] 这类 citation 标签。不要编造未观察到的事实。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"用户问题：{request.user_query}\n\n"
+                        f"项目上下文：\n{context.packed_context[:3000]}\n\n"
+                        f"执行计划：\n{plan_text(plan.tasks)}\n\n"
+                        f"执行观察：\n{limited_json(history, 9000)}\n\n"
+                        f"可引用证据：\n{evidence_brief_text(evidence_items)}\n\n"
+                        "请用简洁中文输出最终答案、关键依据和下一步建议。"
+                    ),
+                },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 900,
+        },
+        timeout=settings.plan_react_llm_timeout_seconds,
+    )
+    response.raise_for_status()
+    return str(response.json()["choices"][0]["message"]["content"]).strip()
+
+
+def execute_plan_react_mcp(
+    db: Session,
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    *,
+    on_plan: Callable[[PlanTasksResponse], None] | None = None,
+    on_step: Callable[[PlanExecutionStep], None] | None = None,
+) -> tuple[PlanTasksResponse, RetrieveResponse, AnswerResponse]:
+    del db
+    if not llm_available():
+        raise ValueError("plan_react_mcp requires LLM_PROVIDER=deepseek and a non-empty LLM_API_KEY.")
+    trace: list[PlanExecutionStep] = []
+    history: list[dict[str, object]] = []
+    evidence_items: list[EvidenceItem] = []
+
+    def append_step(step: PlanExecutionStep) -> None:
+        trace.append(step)
+        if on_step is not None:
+            on_step(step)
+
+    with create_plan_react_mcp_client() as client:
+        catalog = mcp_catalog_payload(client)
+        plan = llm_plan_react_plan(request, context, catalog)
+        if on_plan is not None:
+            on_plan(plan)
+        for task_index, task in enumerate(plan.tasks, start=1):
+            append_step(
+                PlanExecutionStep(
+                    step_id=f"{task.task_id}-start",
+                    task_id=task.task_id,
+                    title=f"Start node: {task.title}",
+                    action="plan_node_start",
+                    summary=f"{task.goal} 完成标准：{task.success_criteria}",
+                    metadata={"max_iterations": task.max_iterations, "node_index": task_index},
+                )
+            )
+            node_done = False
+            for iteration in range(1, max(task.max_iterations, 1) + 1):
+                decision = llm_plan_react_next_step(request, context, catalog, task, history)
+                action_metadata = {
+                    "thought": decision.thought,
+                    "server": decision.server,
+                    "capability_type": decision.capability_type,
+                    "name": decision.name,
+                    "arguments": decision.arguments,
+                    "is_done": decision.is_done,
+                    "answer_fragment": decision.answer_fragment,
+                }
+                append_step(
+                    PlanExecutionStep(
+                        step_id=f"{task.task_id}-react-{iteration}",
+                        task_id=task.task_id,
+                        title=f"ReAct action: {decision.action or 'stop'}",
+                        action="react_action",
+                        summary=(
+                            f"thought={decision.thought or '未提供'}; "
+                            f"action={decision.action or 'stop'}; "
+                            f"target={decision.server}.{decision.capability_type}:{decision.name}"
+                        ),
+                        metadata=action_metadata,
+                    )
+                )
+                history.append({"kind": "action", "task_id": task.task_id, "iteration": iteration, **action_metadata})
+                if decision.is_done or decision.action not in {"mcp_call", "tool", "call_tool", "resource", "prompt", "mcp"}:
+                    node_done = True
+                    append_step(
+                        PlanExecutionStep(
+                            step_id=f"{task.task_id}-complete-{iteration}",
+                            task_id=task.task_id,
+                            title=f"Complete node: {task.title}",
+                            action="plan_node_complete",
+                            summary=decision.answer_fragment or "当前节点已结束。",
+                            metadata={"reason": "is_done" if decision.is_done else "non_mcp_action"},
+                        )
+                    )
+                    history.append(
+                        {
+                            "kind": "node_complete",
+                            "task_id": task.task_id,
+                            "iteration": iteration,
+                            "answer_fragment": decision.answer_fragment,
+                        }
+                    )
+                    break
+                try:
+                    observation = execute_mcp_decision(client, catalog, decision)
+                except (MCPError, ValueError, TypeError) as exc:
+                    observation = PlanReactObservation(
+                        server=decision.server or "github",
+                        capability_type=decision.capability_type or "unknown",
+                        name=decision.name or "",
+                        summary=f"MCP 调用失败：{exc}",
+                        content=f"MCP 调用失败：{exc}",
+                        metadata={"error": str(exc)},
+                        status="failed",
+                    )
+                step_action = "blocked_tool" if observation.status == "blocked" else "mcp_observation"
+                step_status = "failed" if observation.status == "failed" else "completed"
+                step_id = f"{task.task_id}-observation-{iteration}"
+                if observation.status != "blocked":
+                    evidence_items.append(
+                        plan_react_evidence_item(
+                            request,
+                            observation,
+                            index=len(evidence_items) + 1,
+                            step_id=step_id,
+                        )
+                    )
+                history.append(
+                    {
+                        "kind": "observation",
+                        "task_id": task.task_id,
+                        "iteration": iteration,
+                        "server": observation.server,
+                        "capability_type": observation.capability_type,
+                        "name": observation.name,
+                        "summary": observation.summary,
+                        "content": observation.content[:1600],
+                        "metadata": observation.metadata,
+                        "status": observation.status,
+                    }
+                )
+                append_step(
+                    PlanExecutionStep(
+                        step_id=step_id,
+                        task_id=task.task_id,
+                        title=f"MCP observation: {observation.name}",
+                        action=step_action,
+                        summary=f"{observation.summary} {compact_text(observation.content, 220)}",
+                        status=step_status,
+                        evidence_labels=[item.label for item in evidence_items],
+                        metadata={
+                            "server": observation.server,
+                            "capability_type": observation.capability_type,
+                            "name": observation.name,
+                            "risk": observation.metadata.get("risk", ""),
+                            "blocked": observation.metadata.get("blocked", False),
+                            "observation_status": observation.status,
+                        },
+                    )
+                )
+            if not node_done:
+                append_step(
+                    PlanExecutionStep(
+                        step_id=f"{task.task_id}-max-iterations",
+                        task_id=task.task_id,
+                        title=f"Complete node: {task.title}",
+                        action="plan_node_complete",
+                        summary=f"节点达到最大循环次数 {task.max_iterations}，进入下一节点。",
+                        status="skipped",
+                        metadata={"reason": "max_iterations"},
+                    )
+                )
+        answer_text = llm_plan_react_final_answer(request, context, plan, history, evidence_items)
+        retrieval = RetrieveResponse(
+            project_id=request.project_id,
+            session_id=request.session_id,
+            sequence_id=request.sequence_id,
+            retrieval_mode="mcp_plan_react",
+            evidence_items=evidence_items,
+        )
+        answer = AnswerResponse(
+            project_id=request.project_id,
+            session_id=request.session_id,
+            sequence_id=request.sequence_id,
+            answer=answer_text,
+            citations=citations_from_evidence(evidence_items),
+        )
+        plan = plan.model_copy(
+            update={
+                "tasks": mark_tasks_completed(plan.tasks),
+                "execution_trace": trace,
+                "solver_summary": (
+                    f"Plan-ReAct-MCP 完成 {len(plan.tasks)} 个计划节点，"
+                    f"记录 {len([item for item in history if item.get('kind') == 'action'])} 次 ReAct 决策，"
+                    f"保留 {len(evidence_items)} 条 MCP 观察证据。"
+                ),
+                "replan_count": 0,
+                "replan_reason": "",
+            }
+        )
+        return plan, retrieval, answer
 
 
 _RESEARCH_SKILL_REGISTRY: dict[str, ResearchSkillSpec] = {}
@@ -3658,6 +4311,59 @@ def consolidate_memory(
     )
 
 
+def append_memory_updates_to_run(
+    db: Session,
+    project_id: str,
+    session_id: str,
+    sequence_id: int,
+    updates: list[MemoryItem],
+) -> None:
+    if not updates:
+        return
+    run = db.scalar(
+        select(ResearchRun).where(
+            ResearchRun.project_id == project_id,
+            ResearchRun.session_id == session_id,
+            ResearchRun.sequence_id == sequence_id,
+        )
+    )
+    if run is None:
+        return
+    current = ConsolidateMemoryResponse(**run.memory_payload)
+    run.memory_payload = current.model_copy(
+        update={"memory_updates": current.memory_updates + updates}
+    ).model_dump()
+    db.commit()
+
+
+def run_long_term_memory_maintenance(project_id: str, session_id: str, sequence_id: int) -> None:
+    db = SessionLocal()
+    try:
+        updates = consolidate_long_term_memories(db, project_id, session_id, sequence_id)
+        append_memory_updates_to_run(db, project_id, session_id, sequence_id, updates)
+        if updates:
+            db.commit()
+    except Exception as exc:  # pragma: no cover - background safety net
+        db.rollback()
+        logger.warning(
+            "long_term_memory_maintenance_failed project_id=%s session_id=%s sequence_id=%s error=%s",
+            project_id,
+            session_id,
+            sequence_id,
+            exc,
+        )
+    finally:
+        db.close()
+
+
+def start_long_term_memory_maintenance(project_id: str, session_id: str, sequence_id: int) -> None:
+    threading.Thread(
+        target=run_long_term_memory_maintenance,
+        args=(project_id, session_id, sequence_id),
+        daemon=True,
+    ).start()
+
+
 def run_research(db: Session, request: TurnScopedRequest) -> RunResearchResponse:
     project = get_project(db, request.project_id)
     session = get_chat_session(db, request.project_id, request.session_id)
@@ -3665,28 +4371,33 @@ def run_research(db: Session, request: TurnScopedRequest) -> RunResearchResponse
     ensure_next_sequence(session, request.sequence_id)
     assets = resolve_assets(db)
     context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
-    tool_decision = choose_live_tool(request, context)
-    live_route = tool_decision.route
-    if live_route is not None:
-        plan, retrieval, answer = execute_live_tool_plan(request, live_route)
+    tool_decision = ToolPlannerDecision(None, "plan_react_mcp", "default Plan-ReAct-MCP execution")
+    live_route: LiveToolRoute | None = None
+    if settings.execution_mode == "plan_react_mcp":
+        plan, retrieval, answer = execute_plan_react_mcp(db, request, context)
     else:
-        plan = plan_tasks(request, todo=todo)
-        plan, retrieval = execute_plan(request, todo=todo, plan=plan, assets=assets)
-        answer = answer_with_citations(
-            AnswerWithCitationsRequest(
-                project_id=request.project_id,
-                session_id=request.session_id,
-                sequence_id=request.sequence_id,
-                user_query=request.user_query,
-                asset_ids=request.asset_ids,
-                todo_id=request.todo_id,
-                evidence_items=retrieval.evidence_items,
-                plan_summary=plan.plan_summary,
-                plan_tasks=plan.tasks,
-                execution_trace=plan.execution_trace,
-                packed_context=context.packed_context,
+        tool_decision = choose_live_tool(request, context)
+        live_route = tool_decision.route
+        if live_route is not None:
+            plan, retrieval, answer = execute_live_tool_plan(request, live_route)
+        else:
+            plan = plan_tasks(request, todo=todo)
+            plan, retrieval = execute_plan(request, todo=todo, plan=plan, assets=assets)
+            answer = answer_with_citations(
+                AnswerWithCitationsRequest(
+                    project_id=request.project_id,
+                    session_id=request.session_id,
+                    sequence_id=request.sequence_id,
+                    user_query=request.user_query,
+                    asset_ids=request.asset_ids,
+                    todo_id=request.todo_id,
+                    evidence_items=retrieval.evidence_items,
+                    plan_summary=plan.plan_summary,
+                    plan_tasks=plan.tasks,
+                    execution_trace=plan.execution_trace,
+                    packed_context=context.packed_context,
+                )
             )
-        )
     memory = consolidate_memory(
         db,
         ConsolidateMemoryRequest(
@@ -3806,6 +4517,82 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
     ensure_next_sequence(session, request.sequence_id)
     assets = resolve_assets(db)
     context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
+    if settings.execution_mode == "plan_react_mcp":
+        stream_queue: queue.Queue[dict[str, object] | BaseException] = queue.Queue()
+        result: dict[str, tuple[PlanTasksResponse, RetrieveResponse, AnswerResponse]] = {}
+
+        def enqueue_plan(plan_event: PlanTasksResponse) -> None:
+            stream_queue.put({"type": "plan", "plan": plan_event.model_dump(mode="json")})
+
+        def enqueue_step(step_event: PlanExecutionStep) -> None:
+            stream_queue.put({"type": "trace", "step": step_event.model_dump(mode="json")})
+
+        def run_plan_react_worker() -> None:
+            try:
+                result["payload"] = execute_plan_react_mcp(
+                    db,
+                    request,
+                    context,
+                    on_plan=enqueue_plan,
+                    on_step=enqueue_step,
+                )
+            except BaseException as exc:  # noqa: BLE001 - propagate worker errors through the stream iterator.
+                stream_queue.put(exc)
+            finally:
+                stream_queue.put({"type": "_plan_react_done"})
+
+        worker = threading.Thread(target=run_plan_react_worker, daemon=True)
+        worker.start()
+        while True:
+            stream_item = stream_queue.get()
+            if isinstance(stream_item, BaseException):
+                worker.join(timeout=1.0)
+                raise stream_item
+            if stream_item.get("type") == "_plan_react_done":
+                break
+            yield stream_item
+        worker.join(timeout=1.0)
+        plan, retrieval, answer = result["payload"]
+        yield {
+            "type": "solver_summary",
+            "solver_summary": plan.solver_summary,
+            "replan_count": plan.replan_count,
+            "replan_reason": plan.replan_reason,
+        }
+        yield {"type": "answer_delta", "delta": answer.answer, "answer": answer.answer}
+        memory = consolidate_memory(
+            db,
+            ConsolidateMemoryRequest(
+                project_id=request.project_id,
+                session_id=request.session_id,
+                sequence_id=request.sequence_id,
+                user_query=request.user_query,
+                asset_ids=request.asset_ids,
+                todo_id=request.todo_id,
+                answer=answer.answer,
+                citations=answer.citations,
+            ),
+            todo=todo,
+        )
+        answer = attach_answer_quality(plan, retrieval, answer, memory)
+        yield {"type": "answer_quality", "quality": answer.quality.model_dump(mode="json")}
+        trace_id = f"trace-{uuid.uuid4().hex[:12]}"
+        run = persist_research_run(
+            db,
+            project=project,
+            session=session,
+            request=request,
+            context=context,
+            plan=plan,
+            retrieval=retrieval,
+            answer=answer,
+            memory=memory,
+            todo=todo,
+            trace_id=trace_id,
+        )
+        yield {"type": "complete", "run": run_to_detail(run).model_dump(mode="json")}
+        start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
+        return
     tool_decision = choose_live_tool(request, context)
     live_route = tool_decision.route
     if live_route is not None:
@@ -3860,6 +4647,7 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
             "type": "complete",
             "run": run_to_detail(run).model_dump(mode="json"),
         }
+        start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
         return
     plan = plan_tasks(request, todo=todo)
     yield {"type": "plan", "plan": plan.model_dump(mode="json")}
@@ -3941,6 +4729,7 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
         "type": "complete",
         "run": run_to_detail(run).model_dump(mode="json"),
     }
+    start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
 
 
 def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dict[str, object]]:
@@ -3994,6 +4783,7 @@ def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dic
         trace_id=trace_id,
     )
     yield {"type": "complete", "run": run_to_detail(run).model_dump(mode="json")}
+    start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
 
 
 def create_and_run(

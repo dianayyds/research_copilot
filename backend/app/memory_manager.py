@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db_models import EpisodicMemoryItem, SemanticMemoryFact, WorkingMemoryItem
+from app.document_processing import token_count
 from app.models import MemoryItem, MemoryRecordResponse
 from app.semantic_store import get_semantic_memory_store
 from app.vector_store import tokenize
@@ -44,14 +47,72 @@ def split_sentences(text: str, limit: int = 3) -> list[str]:
     return pieces[:limit]
 
 
-def trim_working_memory(db: Session, project_id: str, session_id: str) -> None:
-    items = db.scalars(
+def working_memory_text(item: WorkingMemoryItem) -> str:
+    return f"{item.memory_key}: {item.content}"
+
+
+def working_memory_token_count(item: WorkingMemoryItem) -> int:
+    return max(1, token_count(working_memory_text(item)))
+
+
+def working_memory_token_total(items: list[WorkingMemoryItem]) -> int:
+    return sum(working_memory_token_count(item) for item in items)
+
+
+def normalized_compaction_ratio() -> float:
+    return min(max(settings.working_memory_compaction_ratio, 0.05), 0.9)
+
+
+def llm_memory_available() -> bool:
+    return settings.llm_provider == "deepseek" and bool(settings.llm_api_key)
+
+
+def llm_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {settings.llm_api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def extract_json_object(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("LLM response does not contain a JSON object")
+    return stripped[start : end + 1]
+
+
+def working_memories_chronological(db: Session, project_id: str, session_id: str) -> list[WorkingMemoryItem]:
+    return db.scalars(
         select(WorkingMemoryItem)
         .where(WorkingMemoryItem.project_id == project_id, WorkingMemoryItem.session_id == session_id)
-        .order_by(desc(WorkingMemoryItem.updated_at))
+        .order_by(WorkingMemoryItem.sequence_id, WorkingMemoryItem.created_at)
     ).all()
-    for item in items[settings.working_memory_limit :]:
-        db.delete(item)
+
+
+def select_working_memories_for_context(items: list[WorkingMemoryItem]) -> list[WorkingMemoryItem]:
+    threshold = max(1, settings.working_memory_token_threshold)
+    if working_memory_token_total(items) <= threshold:
+        return items
+    selected: list[WorkingMemoryItem] = []
+    selected_tokens = 0
+    for item in reversed(items):
+        item_tokens = working_memory_token_count(item)
+        if selected and selected_tokens + item_tokens > threshold:
+            continue
+        selected.append(item)
+        selected_tokens += item_tokens
+        if selected_tokens >= threshold:
+            break
+    return list(reversed(selected))
+
+
+def trim_working_memory(db: Session, project_id: str, session_id: str) -> None:
+    compact_working_memory_if_needed(db, project_id, session_id, 0)
 
 
 def serialize_working(item: WorkingMemoryItem) -> MemoryRecordResponse:
@@ -110,12 +171,7 @@ def list_layered_memories(db: Session, project_id: str) -> list[MemoryRecordResp
 
 
 def recent_working_memories(db: Session, project_id: str, session_id: str) -> list[WorkingMemoryItem]:
-    return db.scalars(
-        select(WorkingMemoryItem)
-        .where(WorkingMemoryItem.project_id == project_id, WorkingMemoryItem.session_id == session_id)
-        .order_by(desc(WorkingMemoryItem.updated_at))
-        .limit(settings.working_memory_limit)
-    ).all()
+    return select_working_memories_for_context(working_memories_chronological(db, project_id, session_id))
 
 
 def episodic_score(query: str, item: EpisodicMemoryItem) -> float:
@@ -219,7 +275,7 @@ def build_memory_context_bundle(db: Session, project_id: str, session_id: str, q
     episodic = relevant_episodic_memories(db, project_id, query)
     semantic = relevant_semantic_memories(db, project_id, query)
     return MemoryContextBundle(
-        working_lines=[f"- {item.memory_key}: {compact_text(item.content, 140)}" for item in reversed(working)],
+        working_lines=[f"- {item.memory_key}: {compact_text(item.content, 240)}" for item in working],
         episodic_lines=[f"- [{item.event_type}] {compact_text(item.summary, 160)}" for item in episodic],
         semantic_lines=[f"- {item.fact_type}.{item.memory_key}: {compact_text(item.statement, 160)}" for item in semantic],
     )
@@ -259,7 +315,6 @@ def store_working_memory(
     for item in items:
         db.add(item)
     db.flush()
-    trim_working_memory(db, project_id, session_id)
     return items
 
 
@@ -428,6 +483,283 @@ def store_semantic_memories(
     return stored
 
 
+@dataclass
+class WorkingMemoryCompactionResult:
+    compacted_items: list[WorkingMemoryItem]
+    compacted_tokens: int = 0
+    total_tokens: int = 0
+    summary: str = ""
+    episodic: list[EpisodicMemoryItem] | None = None
+    semantic: list[SemanticMemoryFact] | None = None
+
+    @property
+    def episodic_items(self) -> list[EpisodicMemoryItem]:
+        return self.episodic or []
+
+    @property
+    def semantic_items(self) -> list[SemanticMemoryFact]:
+        return self.semantic or []
+
+
+def select_working_memories_for_compaction(items: list[WorkingMemoryItem]) -> tuple[list[WorkingMemoryItem], int, int]:
+    total_tokens = working_memory_token_total(items)
+    threshold = max(1, settings.working_memory_token_threshold)
+    if total_tokens <= threshold:
+        return [], total_tokens, 0
+
+    target_tokens = max(1, math.ceil(threshold * normalized_compaction_ratio()))
+    selected: list[WorkingMemoryItem] = []
+    selected_tokens = 0
+    for item in items:
+        selected.append(item)
+        selected_tokens += working_memory_token_count(item)
+        if selected_tokens >= target_tokens:
+            break
+    return selected, total_tokens, selected_tokens
+
+
+def working_memory_payload(items: list[WorkingMemoryItem]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item.id,
+            "memory_key": item.memory_key,
+            "content": item.content,
+            "kind": item.meta_payload.get("kind", ""),
+            "sequence_id": item.sequence_id,
+            "importance": item.importance,
+            "metadata": item.meta_payload,
+        }
+        for item in items
+    ]
+
+
+def llm_summarize_working_memories(
+    project_id: str,
+    session_id: str,
+    sequence_id: int,
+    compacted_items: list[WorkingMemoryItem],
+    compacted_tokens: int,
+    total_tokens: int,
+) -> dict[str, Any]:
+    payload = {
+        "project_id": project_id,
+        "session_id": session_id,
+        "trigger_sequence_id": sequence_id,
+        "compacted_tokens": compacted_tokens,
+        "total_working_memory_tokens": total_tokens,
+        "working_memories": working_memory_payload(compacted_items),
+    }
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot 的长期记忆整理器。"
+                        "你只能返回一个 JSON 对象，不要 Markdown，不要解释。"
+                        "根据输入的 working memories，提炼值得长期保存的 episodic memory 和 semantic memory。"
+                        "不要对每条候选执行 ADD/UPDATE/DELETE/NOOP 判断；只输出本批应新增保存的长期记忆。"
+                        "忽略寒暄、临时表述、重复内容和没有长期价值的细节。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "输出 JSON schema：\n"
+                        "{"
+                        '"episodic_memories": ['
+                        '{"event_type": "working_memory_summary", "summary": "事件摘要", '
+                        '"details": {"key": "value"}, "importance": 0.7}'
+                        "], "
+                        '"semantic_memories": ['
+                        '{"fact_type": "fact|decision|preference|open_question|progress", '
+                        '"memory_key": "stable_key", "statement": "可复用事实", '
+                        '"subject": "project|user", "predicate": "关系", "object": "宾语", '
+                        '"importance": 0.7, "metadata": {"key": "value"}}'
+                        "]"
+                        "}\n\n"
+                        "输入 JSON：\n"
+                        f"{json.dumps(payload, ensure_ascii=False, default=str)}"
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1200,
+        },
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    content = str(response.json()["choices"][0]["message"]["content"]).strip()
+    data = json.loads(extract_json_object(content))
+    if not isinstance(data, dict):
+        raise ValueError("LLM memory summary must be a JSON object")
+    return data
+
+
+def coerce_importance(value: Any, default: float = 0.7) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = default
+    return max(0.0, min(1.0, score))
+
+
+def compaction_metadata(
+    compacted_items: list[WorkingMemoryItem],
+    compacted_tokens: int,
+    total_tokens: int,
+) -> dict[str, Any]:
+    return {
+        "source": "llm_working_memory_summary",
+        "compacted_item_ids": [item.id for item in compacted_items],
+        "compacted_memory_keys": [item.memory_key for item in compacted_items],
+        "compacted_tokens": compacted_tokens,
+        "total_working_memory_tokens": total_tokens,
+        "compaction_ratio": normalized_compaction_ratio(),
+    }
+
+
+def store_llm_episodic_memories(
+    db: Session,
+    project_id: str,
+    session_id: str,
+    sequence_id: int,
+    payload: dict[str, Any],
+    compacted_items: list[WorkingMemoryItem],
+    compacted_tokens: int,
+    total_tokens: int,
+) -> list[EpisodicMemoryItem]:
+    base_metadata = compaction_metadata(compacted_items, compacted_tokens, total_tokens)
+    memories = payload.get("episodic_memories") or []
+    if not isinstance(memories, list):
+        return []
+    stored: list[EpisodicMemoryItem] = []
+    for index, item in enumerate(memories, start=1):
+        if not isinstance(item, dict):
+            continue
+        summary = compact_text(str(item.get("summary") or ""), 900)
+        if not summary:
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        episode = EpisodicMemoryItem(
+            id=make_id("ep"),
+            project_id=project_id,
+            session_id=session_id,
+            sequence_id=sequence_id,
+            event_type=compact_text(str(item.get("event_type") or "working_memory_summary"), 48),
+            summary=summary,
+            details={**base_metadata, **details, "llm_memory_index": index},
+            importance=coerce_importance(item.get("importance"), 0.74),
+        )
+        db.add(episode)
+        stored.append(episode)
+    db.flush()
+    return stored
+
+
+def semantic_draft_from_llm_item(
+    item: dict[str, Any],
+    index: int,
+    metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    statement = compact_text(str(item.get("statement") or ""), 900)
+    if not statement:
+        return None
+    fact_type = compact_text(str(item.get("fact_type") or "fact"), 32)
+    if fact_type not in {"fact", "decision", "preference", "open_question", "progress"}:
+        fact_type = "fact"
+    raw_metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    return {
+        "fact_type": fact_type,
+        "memory_key": compact_text(str(item.get("memory_key") or f"{fact_type}_{slugify(statement)}"), 64),
+        "statement": statement,
+        "subject": compact_text(str(item.get("subject") or "project"), 120),
+        "predicate": compact_text(str(item.get("predicate") or "long_term_memory"), 120),
+        "object": compact_text(str(item.get("object") or statement), 240),
+        "importance": coerce_importance(item.get("importance"), 0.72),
+        "metadata": {**metadata, **raw_metadata, "llm_memory_index": index},
+    }
+
+
+def store_llm_semantic_memories(
+    db: Session,
+    project_id: str,
+    session_id: str,
+    sequence_id: int,
+    payload: dict[str, Any],
+    compacted_items: list[WorkingMemoryItem],
+    compacted_tokens: int,
+    total_tokens: int,
+) -> list[SemanticMemoryFact]:
+    base_metadata = compaction_metadata(compacted_items, compacted_tokens, total_tokens)
+    memories = payload.get("semantic_memories") or []
+    if not isinstance(memories, list):
+        return []
+    drafts = [
+        draft
+        for index, item in enumerate(memories, start=1)
+        if isinstance(item, dict)
+        for draft in [semantic_draft_from_llm_item(item, index, base_metadata)]
+        if draft is not None
+    ]
+    stored = [
+        upsert_semantic_fact(db, project_id, session_id, sequence_id, draft)
+        for draft in drafts
+    ]
+    get_semantic_memory_store().upsert_facts(project_id, [semantic_fact_payload(item) for item in stored])
+    return stored
+
+
+def compact_working_memory_if_needed(
+    db: Session,
+    project_id: str,
+    session_id: str,
+    sequence_id: int,
+) -> WorkingMemoryCompactionResult:
+    items = working_memories_chronological(db, project_id, session_id)
+    selected, total_tokens, selected_tokens = select_working_memories_for_compaction(items)
+    if not selected or not llm_memory_available():
+        return WorkingMemoryCompactionResult([], total_tokens=total_tokens)
+
+    payload = llm_summarize_working_memories(project_id, session_id, sequence_id, selected, selected_tokens, total_tokens)
+    episodic = store_llm_episodic_memories(
+        db,
+        project_id,
+        session_id,
+        sequence_id,
+        payload,
+        selected,
+        selected_tokens,
+        total_tokens,
+    )
+    semantic = store_llm_semantic_memories(
+        db,
+        project_id,
+        session_id,
+        sequence_id,
+        payload,
+        selected,
+        selected_tokens,
+        total_tokens,
+    )
+    if not episodic and not semantic:
+        return WorkingMemoryCompactionResult([], total_tokens=total_tokens)
+    for item in selected:
+        db.delete(item)
+    db.flush()
+    return WorkingMemoryCompactionResult(
+        compacted_items=selected,
+        compacted_tokens=selected_tokens,
+        total_tokens=total_tokens,
+        summary="llm_working_memory_summary",
+        episodic=episodic,
+        semantic=semantic,
+    )
+
+
 def consolidate_layered_memories(
     db: Session,
     project_id: str,
@@ -439,27 +771,7 @@ def consolidate_layered_memories(
     todo_title: str | None = None,
 ) -> list[MemoryItem]:
     working = store_working_memory(db, project_id, session_id, sequence_id, user_query, answer, citations)
-    episodic = store_episodic_memory(
-        db,
-        project_id,
-        session_id,
-        sequence_id,
-        user_query,
-        answer,
-        citations,
-        todo_title=todo_title,
-    )
-    semantic = store_semantic_memories(
-        db,
-        project_id,
-        session_id,
-        sequence_id,
-        user_query,
-        answer,
-        citations,
-        todo_title=todo_title,
-    )
-    updates = [
+    return [
         MemoryItem(
             memory_type="working",
             key=item.memory_key,
@@ -472,18 +784,28 @@ def consolidate_layered_memories(
         )
         for item in working
     ]
-    updates.append(
+
+
+def consolidate_long_term_memories(
+    db: Session,
+    project_id: str,
+    session_id: str,
+    sequence_id: int,
+) -> list[MemoryItem]:
+    compaction = compact_working_memory_if_needed(db, project_id, session_id, sequence_id)
+    updates = [
         MemoryItem(
             memory_type="episodic",
-            key=episodic.event_type,
-            value=episodic.summary,
-            source=episodic.source,
-            session_id=episodic.session_id,
-            sequence_id=episodic.sequence_id,
-            importance=episodic.importance,
-            metadata=episodic.details,
+            key=item.event_type,
+            value=item.summary,
+            source=item.source,
+            session_id=item.session_id,
+            sequence_id=item.sequence_id,
+            importance=item.importance,
+            metadata=item.details,
         )
-    )
+        for item in compaction.episodic_items
+    ]
     updates.extend(
         MemoryItem(
             memory_type=f"semantic.{item.fact_type}",
@@ -495,6 +817,6 @@ def consolidate_layered_memories(
             importance=item.importance,
             metadata=item.meta_payload,
         )
-        for item in semantic
+        for item in compaction.semantic_items
     )
     return updates

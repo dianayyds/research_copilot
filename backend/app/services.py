@@ -4,13 +4,15 @@ import ast
 from io import BytesIO
 import logging
 import math
+import queue
 import re
+import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from time import perf_counter
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import httpx
 from sqlalchemy import desc, select
@@ -18,9 +20,17 @@ from sqlalchemy.orm import Session
 
 from app.asset_ingest import parse_uploaded_asset
 from app.config import settings
+from app.db import SessionLocal
 from app.db_models import Asset, ChatSession, Project, ResearchRun, Todo, WorkingMemoryItem
+from app.document_processing import ChunkRecord, build_asset_chunks
 from app.live_tools import LiveToolResult, LiveToolRoute, execute_live_tool, select_live_tool
-from app.memory_manager import build_memory_context_bundle, consolidate_layered_memories, list_layered_memories
+from app.memory_manager import (
+    build_memory_context_bundle,
+    consolidate_layered_memories,
+    consolidate_long_term_memories,
+    list_layered_memories,
+)
+from app.mcp_client import MCPClient, MCPError, create_github_mcp_client
 from app.models import (
     AnswerQualityReport,
     AnswerResponse,
@@ -36,6 +46,7 @@ from app.models import (
     ConsolidateMemoryRequest,
     ConsolidateMemoryResponse,
     EvidenceItem,
+    MemoryItem,
     MemoryRecordResponse,
     PlanExecutionStep,
     PlanTasksResponse,
@@ -102,16 +113,6 @@ MEMORY_STOP_TERMS = {
 logger = logging.getLogger("uvicorn.error")
 
 
-@dataclass
-class ChunkRecord:
-    asset_id: str
-    chunk_id: str
-    title: str
-    asset_type: str
-    content: str
-    source_path: str
-
-
 @dataclass(frozen=True)
 class ToolPlannerDecision:
     route: LiveToolRoute | None
@@ -157,22 +158,27 @@ class AgentToolObservation:
     metadata: dict[str, object]
 
 
+@dataclass(frozen=True)
+class PlanReactDecision:
+    thought: str
+    action: str
+    server: str
+    capability_type: str
+    name: str
+    arguments: dict[str, object]
+    is_done: bool = False
+    answer_fragment: str = ""
+
+
 @dataclass
-class LatsAgentNode:
-    node_id: str
-    parent: LatsAgentNode | None
-    depth: int
-    history: list[dict[str, object]]
-    decision: AgentDecision | None = None
-    observation: AgentToolObservation | None = None
-    evidence_items: list[EvidenceItem] = field(default_factory=list)
-    children: list[LatsAgentNode] = field(default_factory=list)
-    visits: int = 0
-    value_sum: float = 0.0
-    prior: float = 0.0
-    score: float = 0.0
-    terminal: bool = False
-    reflection: str = ""
+class PlanReactObservation:
+    server: str
+    capability_type: str
+    name: str
+    summary: str
+    content: str
+    metadata: dict[str, object]
+    status: str = "completed"
 
 
 def make_id(prefix: str) -> str:
@@ -190,26 +196,6 @@ def compact_text(text: str, limit: int = 80) -> str:
 def slugify(text: str) -> str:
     normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "-", text.strip().lower())
     return normalized.strip("-")[:48] or "chunk"
-
-
-def split_chunks(text: str) -> list[str]:
-    paragraphs = [item.strip() for item in text.splitlines() if item.strip()]
-    joined = paragraphs or [text.strip()]
-    chunks: list[str] = []
-    current: list[str] = []
-    current_length = 0
-    for paragraph in joined:
-        next_length = current_length + len(paragraph)
-        if current and next_length > settings.asset_chunk_size:
-            chunks.append("\n".join(current))
-            current = [paragraph]
-            current_length = len(paragraph)
-            continue
-        current.append(paragraph)
-        current_length = next_length
-    if current:
-        chunks.append("\n".join(current))
-    return chunks
 
 
 def markdown_sections(text: str) -> list[tuple[str, str]]:
@@ -432,23 +418,7 @@ def build_chunks(assets: list[Asset], asset_ids: list[str]) -> list[ChunkRecord]
     selected_assets = [asset for asset in assets if not allowed or asset.id in allowed]
     chunks: list[ChunkRecord] = []
     for asset in selected_assets:
-        section_index = 0
-        for heading, body in markdown_sections(asset.content):
-            for chunk_index, chunk_text in enumerate(split_chunks(body), start=1):
-                section_index += 1
-                heading_slug = slugify(heading)
-                source_path = f"/assets/{asset.id}#{heading_slug}" if heading != "正文" else f"/assets/{asset.id}"
-                display_title = asset.title if heading == "正文" else f"{asset.title} · {heading}"
-                chunks.append(
-                    ChunkRecord(
-                        asset_id=asset.id,
-                        chunk_id=f"{asset.id}-{heading_slug}-{section_index:03d}-{chunk_index:03d}",
-                        title=display_title,
-                        asset_type=asset.asset_type,
-                        content=chunk_text,
-                        source_path=source_path,
-                    )
-                )
+        chunks.extend(build_asset_chunks(asset))
     return chunks
 
 
@@ -461,6 +431,12 @@ def chunk_payloads(assets: list[Asset], asset_ids: list[str]) -> list[dict[str, 
             "asset_type": chunk.asset_type,
             "content": chunk.content,
             "source_path": chunk.source_path,
+            "chunk_level": chunk.chunk_level,
+            "parent_id": chunk.parent_id,
+            "section_path": chunk.section_path,
+            "page_start": str(chunk.page_start),
+            "page_end": str(chunk.page_end),
+            "token_count": str(chunk.token_count),
         }
         for chunk in build_chunks(assets, asset_ids)
     ]
@@ -648,6 +624,28 @@ def total_chunks_for(file_size: int, chunk_size: int) -> int:
     return max(1, math.ceil(file_size / chunk_size))
 
 
+def validate_resumable_upload_resume(
+    upload_id: str,
+    meta: dict[str, str],
+    *,
+    file_md5: str,
+    file_size: int,
+) -> None:
+    mismatches: list[str] = []
+    if meta.get("file_md5") and meta["file_md5"] != file_md5:
+        mismatches.append("file_md5")
+    try:
+        existing_size = int(meta.get("file_size", ""))
+    except ValueError as exc:
+        raise ValueError(f"Upload {upload_id} metadata is invalid; restart the upload") from exc
+    if existing_size != file_size:
+        mismatches.append("file_size")
+    if mismatches:
+        raise ValueError(
+            f"Upload {upload_id} metadata does not match requested file: {', '.join(mismatches)}"
+        )
+
+
 def resumable_upload_status(
     db: Session,
     upload_id: str,
@@ -691,7 +689,9 @@ def init_resumable_asset_upload(
     upload_id = file_md5
     store = get_upload_progress_store()
     existing = store.get_meta(upload_id)
-    if not existing:
+    if existing:
+        validate_resumable_upload_resume(upload_id, existing, file_md5=file_md5, file_size=payload.file_size)
+    else:
         now = utc_now().isoformat()
         store.save_meta(
             upload_id,
@@ -1403,6 +1403,40 @@ def merge_retrieval_hits(hit_groups: list[tuple[str, list[dict[str, object]], fl
     return ranked[:limit]
 
 
+def centered_context(parent_content: str, child_content: str, limit: int) -> str:
+    clean_parent = " ".join(parent_content.split())
+    clean_child = " ".join(child_content.split())
+    if len(clean_parent) <= limit:
+        return clean_parent
+    pivot = clean_parent.find(clean_child[: max(min(len(clean_child), 160), 40)])
+    if pivot < 0:
+        return clean_parent[:limit].strip()
+    start = max(pivot - (limit // 3), 0)
+    end = min(start + limit, len(clean_parent))
+    start = max(end - limit, 0)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(clean_parent) else ""
+    return f"{prefix}{clean_parent[start:end].strip()}{suffix}"
+
+
+def expand_child_hit_context(hit: dict[str, object], payload_by_id: dict[str, dict[str, str]]) -> dict[str, object]:
+    parent_id = str(hit.get("parent_id") or "")
+    parent = payload_by_id.get(parent_id)
+    if not parent:
+        return {**hit, "context_content": str(hit.get("content", ""))}
+    context = centered_context(
+        str(parent.get("content", "")),
+        str(hit.get("content", "")),
+        settings.asset_context_snippet_chars,
+    )
+    return {
+        **hit,
+        "context_content": context,
+        "parent_title": parent.get("title", hit.get("title", "")),
+        "parent_source_path": parent.get("source_path", hit.get("source_path", "")),
+    }
+
+
 def plan_text(tasks: list[ResearchTask]) -> str:
     lines = []
     for index, task in enumerate(tasks, start=1):
@@ -1454,7 +1488,7 @@ def build_context(
         "- no prior turns yet",
         limit=900,
     )
-    working_context = context_excerpt(memory_bundle.working_text, "- no working memory yet", limit=1000)
+    working_context = memory_bundle.working_text
     episodic_context = context_excerpt(memory_bundle.episodic_text, "- no episodic memory yet", limit=1200)
     semantic_context = context_excerpt(memory_bundle.semantic_text, "- no semantic memory yet", limit=1200)
     asset_scope = asset_scope_summary(assets)
@@ -1586,18 +1620,27 @@ def hybrid_retrieve(
         for search_query in (search_queries or [request.user_query])
     ]
     ranked = merge_retrieval_hits(query_hits, settings.retrieval_limit)
+    payload_by_id = {str(chunk["chunk_id"]): chunk for chunk in payloads}
+    expanded = [expand_child_hit_context(chunk, payload_by_id) for chunk in ranked]
     evidence_items = [
         EvidenceItem(
             asset_id=str(chunk["asset_id"]),
             chunk_id=str(chunk["chunk_id"]),
             label=f"C{index}",
-            title=str(chunk["title"]),
-            snippet=str(chunk["content"])[:320],
-            source_path=str(chunk["source_path"]),
+            title=str(chunk.get("parent_title") or chunk["title"]),
+            snippet=str(chunk.get("context_content") or chunk["content"]),
+            source_path=str(chunk.get("parent_source_path") or chunk["source_path"]),
             score=round(float(chunk["score"]), 4),
-            tags=[str(chunk["asset_type"]), "plan", "hybrid", "reranked", compact_text(str(chunk["matched_query"]), 48)],
+            tags=[
+                str(chunk["asset_type"]),
+                "plan",
+                "hybrid",
+                "child-reranked",
+                "parent-context",
+                compact_text(str(chunk["matched_query"]), 48),
+            ],
         )
-        for index, chunk in enumerate(ranked, start=1)
+        for index, chunk in enumerate(expanded, start=1)
     ]
     return RetrieveResponse(
         project_id=request.project_id,
@@ -2358,6 +2401,598 @@ def agent_should_use_direct_llm_fallback(
     if observations and all(isinstance(item.get("metadata"), dict) and item["metadata"].get("error") for item in observations):
         return True
     return False
+
+
+def create_plan_react_mcp_client() -> MCPClient:
+    return create_github_mcp_client()
+
+
+def limited_json(value: object, limit: int = 1600) -> str:
+    return compact_text(json.dumps(value, ensure_ascii=False, default=str), limit)
+
+
+def mcp_list_capability(client: MCPClient, method_name: str) -> list[dict[str, Any]]:
+    try:
+        if method_name == "tools":
+            return client.list_tools()
+        if method_name == "resources":
+            return client.list_resources()
+        if method_name == "prompts":
+            return client.list_prompts()
+    except MCPError as exc:
+        logger.warning("mcp_list_capability_failed server=%s method=%s error=%s", client.config.name, method_name, exc)
+    return []
+
+
+def mcp_catalog_payload(client: MCPClient) -> dict[str, object]:
+    tools = mcp_list_capability(client, "tools")
+    resources = mcp_list_capability(client, "resources")
+    prompts = mcp_list_capability(client, "prompts")
+    return {
+        "servers": [
+            {
+                "name": client.config.name,
+                "transport": client.config.transport,
+                "server_info": client.server_info,
+                "tools": tools,
+                "resources": resources,
+                "prompts": prompts,
+            }
+        ]
+    }
+
+
+def mcp_catalog_prompt(catalog: dict[str, object]) -> str:
+    servers = catalog.get("servers") or []
+    summaries = []
+    server_iter = servers if isinstance(servers, list) else []
+    for server in server_iter:
+        if not isinstance(server, dict):
+            continue
+        summaries.append(
+            {
+                "name": server.get("name"),
+                "tools": [
+                    {
+                        "name": item.get("name"),
+                        "description": compact_text(str(item.get("description") or ""), 180),
+                        "inputSchema": item.get("inputSchema") or item.get("input_schema") or {},
+                        "annotations": item.get("annotations") or {},
+                    }
+                    for item in (server.get("tools") or [])[:30]
+                    if isinstance(item, dict)
+                ],
+                "resources": [
+                    {
+                        "uri": item.get("uri"),
+                        "name": item.get("name"),
+                        "description": compact_text(str(item.get("description") or ""), 160),
+                        "mimeType": item.get("mimeType"),
+                    }
+                    for item in (server.get("resources") or [])[:30]
+                    if isinstance(item, dict)
+                ],
+                "prompts": [
+                    {
+                        "name": item.get("name"),
+                        "description": compact_text(str(item.get("description") or ""), 160),
+                        "arguments": item.get("arguments") or [],
+                    }
+                    for item in (server.get("prompts") or [])[:30]
+                    if isinstance(item, dict)
+                ],
+            }
+        )
+    return limited_json({"servers": summaries}, 6000)
+
+
+def llm_plan_react_plan(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    catalog: dict[str, object],
+) -> PlanTasksResponse:
+    if not llm_available():
+        raise ValueError("plan_react_mcp requires LLM_PROVIDER=deepseek and a non-empty LLM_API_KEY.")
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot 的 Plan-ReAct-MCP planner。"
+                        "只返回 JSON 对象，不要 Markdown。你要先输出计划，不要直接回答。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "请基于用户问题、项目上下文和 MCP 能力目录输出执行计划。\n\n"
+                        "JSON schema：{"
+                        '"plan_summary":"一句话计划",'
+                        '"tasks":[{"task_id":"task-1","title":"节点标题","goal":"节点目标",'
+                        '"success_criteria":"何时完成该节点","max_iterations":4}]}。\n\n'
+                        "约束：\n"
+                        f"- 最多 {settings.plan_react_max_tasks} 个任务。\n"
+                        f"- 每个任务 max_iterations 默认 {settings.plan_react_default_node_iterations}，范围 1-8。\n"
+                        "- 每个任务后续会独立执行 thought -> action -> observation 循环。\n"
+                        "- 如果问题需要 GitHub 信息，计划应使用 GitHub MCP 能力。\n\n"
+                        f"用户问题：{request.user_query}\n\n"
+                        f"项目上下文：\n{context.packed_context[:5000]}\n\n"
+                        f"MCP 能力目录：\n{mcp_catalog_prompt(catalog)}"
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1000,
+        },
+        timeout=settings.plan_react_llm_timeout_seconds,
+    )
+    response.raise_for_status()
+    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
+    tasks_payload = payload.get("tasks") or []
+    if not isinstance(tasks_payload, list) or not tasks_payload:
+        raise ValueError("Plan-ReAct planner did not return any tasks")
+    tasks: list[ResearchTask] = []
+    for index, item in enumerate(tasks_payload[: max(settings.plan_react_max_tasks, 1)], start=1):
+        if not isinstance(item, dict):
+            continue
+        max_iterations = item.get("max_iterations", settings.plan_react_default_node_iterations)
+        try:
+            max_iterations_int = max(1, min(8, int(max_iterations)))
+        except (TypeError, ValueError):
+            max_iterations_int = settings.plan_react_default_node_iterations
+        tasks.append(
+            ResearchTask(
+                task_id=str(item.get("task_id") or f"task-{index}"),
+                title=compact_text(str(item.get("title") or f"Plan node {index}"), 120),
+                goal=compact_text(str(item.get("goal") or request.user_query), 500),
+                task_type="plan_react_node",
+                depends_on=[f"task-{index - 1}"] if index > 1 else [],
+                output_key=f"node_{index}_result",
+                success_criteria=compact_text(str(item.get("success_criteria") or "节点观察足以支持最终回答。"), 500),
+                max_iterations=max_iterations_int,
+                metadata={"planner": "llm_plan_react_mcp"},
+            )
+        )
+    if not tasks:
+        raise ValueError("Plan-ReAct planner returned invalid tasks")
+    return PlanTasksResponse(
+        project_id=request.project_id,
+        session_id=request.session_id,
+        sequence_id=request.sequence_id,
+        planner_mode="plan_react_mcp",
+        plan_summary=compact_text(str(payload.get("plan_summary") or "先规划，再逐节点执行 ReAct + MCP。"), 500),
+        search_queries=[],
+        tasks=tasks,
+    )
+
+
+def plan_react_decision_from_payload(payload: dict[str, object]) -> PlanReactDecision:
+    arguments = payload.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return PlanReactDecision(
+        thought=compact_text(str(payload.get("thought") or ""), 500),
+        action=str(payload.get("action") or "").strip(),
+        server=str(payload.get("server") or "github").strip() or "github",
+        capability_type=str(payload.get("capability_type") or "").strip().lower(),
+        name=str(payload.get("name") or "").strip(),
+        arguments=dict(arguments),
+        is_done=planner_truthy(payload.get("is_done", False)),
+        answer_fragment=compact_text(str(payload.get("answer_fragment") or ""), 1200),
+    )
+
+
+def llm_plan_react_next_step(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    catalog: dict[str, object],
+    task: ResearchTask,
+    history: list[dict[str, object]],
+) -> PlanReactDecision:
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot 的 ReAct 执行器。只能返回 JSON 对象，不要 Markdown。"
+                        "每轮先简短 thought，再选择一个 MCP action 或结束当前节点。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "输出 JSON schema：{"
+                        '"thought":"简短思考",'
+                        '"action":"mcp_call|final_answer|stop",'
+                        '"server":"github",'
+                        '"capability_type":"tool|resource|prompt",'
+                        '"name":"工具名/资源URI/提示词名",'
+                        '"arguments":{},'
+                        '"is_done":false,'
+                        '"answer_fragment":"节点完成时的阶段性结论"}。\n\n'
+                        "规则：\n"
+                        "- 需要调用 MCP 时 action=mcp_call，并填写 capability_type/name/arguments。\n"
+                        "- resource 的 name 填 uri；prompt 的 name 填 prompt name。\n"
+                        "- 当前节点已经满足 success_criteria 时，is_done=true。\n"
+                        "- 每轮最多选择一个 action。\n\n"
+                        f"用户问题：{request.user_query}\n\n"
+                        f"当前节点：{task.model_dump(mode='json')}\n\n"
+                        f"项目上下文：\n{context.packed_context[:3000]}\n\n"
+                        f"MCP 能力目录：\n{mcp_catalog_prompt(catalog)}\n\n"
+                        f"已有 action/observation：\n{limited_json(history[-10:], 5000)}"
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 800,
+        },
+        timeout=settings.plan_react_llm_timeout_seconds,
+    )
+    response.raise_for_status()
+    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
+    if not isinstance(payload, dict):
+        raise ValueError("Plan-ReAct decision must be a JSON object")
+    return plan_react_decision_from_payload(payload)
+
+
+def mcp_tool_by_name(catalog: dict[str, object], server_name: str, tool_name: str) -> dict[str, object]:
+    for server in catalog.get("servers") or []:
+        if not isinstance(server, dict) or str(server.get("name")) != server_name:
+            continue
+        for tool in server.get("tools") or []:
+            if isinstance(tool, dict) and str(tool.get("name")) == tool_name:
+                return dict(tool)
+    return {}
+
+
+def mcp_tool_is_read_only(tool: dict[str, object], tool_name: str) -> bool:
+    annotations = tool.get("annotations") or {}
+    if isinstance(annotations, dict) and planner_truthy(annotations.get("readOnlyHint", False)):
+        return True
+    if planner_truthy(tool.get("readOnlyHint", False)):
+        return True
+    return tool_name.lower().startswith(("get", "list", "search", "read"))
+
+
+def side_effect_tool_allowed(tool_name: str) -> bool:
+    return tool_name in set(settings.mcp_github_allowed_side_effect_tools)
+
+
+def summarize_mcp_result(result: dict[str, Any]) -> str:
+    content = result.get("content")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if "text" in item:
+                parts.append(str(item.get("text") or ""))
+            elif "resource" in item:
+                parts.append(limited_json(item.get("resource"), 800))
+            else:
+                parts.append(limited_json(item, 800))
+        if parts:
+            return compact_text("\n".join(parts), 3000)
+    contents = result.get("contents")
+    if isinstance(contents, list):
+        parts = []
+        for item in contents:
+            if not isinstance(item, dict):
+                continue
+            parts.append(str(item.get("text") or item.get("blob") or limited_json(item, 800)))
+        if parts:
+            return compact_text("\n".join(parts), 3000)
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        return compact_text(limited_json(messages, 3000), 3000)
+    return limited_json(result, 3000)
+
+
+def execute_mcp_decision(
+    client: MCPClient,
+    catalog: dict[str, object],
+    decision: PlanReactDecision,
+) -> PlanReactObservation:
+    capability = decision.capability_type.rstrip("s")
+    server = decision.server or "github"
+    if server != client.config.name:
+        raise ValueError(f"Unsupported MCP server: {server}")
+    if capability == "tool":
+        tool = mcp_tool_by_name(catalog, server, decision.name)
+        read_only = mcp_tool_is_read_only(tool, decision.name)
+        if not read_only and not side_effect_tool_allowed(decision.name):
+            return PlanReactObservation(
+                server=server,
+                capability_type="tool",
+                name=decision.name,
+                summary=f"阻断有副作用 MCP tool：{decision.name}",
+                content=f"工具 {decision.name} 不是 read-only，且不在 MCP_GITHUB_ALLOWED_SIDE_EFFECT_TOOLS allowlist 中。",
+                metadata={"risk": "side_effect", "read_only": False, "blocked": True},
+                status="blocked",
+            )
+        result = client.call_tool(decision.name, decision.arguments)
+        return PlanReactObservation(
+            server=server,
+            capability_type="tool",
+            name=decision.name,
+            summary=f"调用 MCP tool：{decision.name}",
+            content=summarize_mcp_result(result),
+            metadata={"risk": "read_only" if read_only else "side_effect_allowed", "raw": result},
+        )
+    if capability == "resource":
+        uri = decision.name or str(decision.arguments.get("uri") or "")
+        result = client.read_resource(uri)
+        return PlanReactObservation(
+            server=server,
+            capability_type="resource",
+            name=uri,
+            summary=f"读取 MCP resource：{uri}",
+            content=summarize_mcp_result(result),
+            metadata={"risk": "read_only", "raw": result},
+        )
+    if capability == "prompt":
+        result = client.get_prompt(decision.name, decision.arguments)
+        return PlanReactObservation(
+            server=server,
+            capability_type="prompt",
+            name=decision.name,
+            summary=f"读取 MCP prompt：{decision.name}",
+            content=summarize_mcp_result(result),
+            metadata={"risk": "read_only", "raw": result},
+        )
+    raise ValueError(f"Unsupported MCP capability_type: {decision.capability_type}")
+
+
+def plan_react_evidence_item(
+    request: TurnScopedRequest,
+    observation: PlanReactObservation,
+    *,
+    index: int,
+    step_id: str,
+) -> EvidenceItem:
+    return EvidenceItem(
+        asset_id=f"mcp:{observation.server}",
+        chunk_id=f"{step_id}:{observation.capability_type}:{observation.name}",
+        label=f"C{index}",
+        title=f"{observation.server}.{observation.capability_type}:{observation.name}",
+        snippet=observation.content[:320],
+        source_path=f"mcp://{observation.server}/{observation.capability_type}/{observation.name}",
+        score=1.0,
+        tags=["mcp", observation.server, observation.capability_type, request.project_id],
+    )
+
+
+def llm_plan_react_final_answer(
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    plan: PlanTasksResponse,
+    history: list[dict[str, object]],
+    evidence_items: list[EvidenceItem],
+) -> str:
+    response = httpx.post(
+        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+        headers=llm_headers(),
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 Research Copilot。请基于 Plan-ReAct-MCP 的观察结果回答用户。"
+                        "如果引用 MCP observation，请使用 [C1] 这类 citation 标签。不要编造未观察到的事实。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"用户问题：{request.user_query}\n\n"
+                        f"项目上下文：\n{context.packed_context[:3000]}\n\n"
+                        f"执行计划：\n{plan_text(plan.tasks)}\n\n"
+                        f"执行观察：\n{limited_json(history, 9000)}\n\n"
+                        f"可引用证据：\n{evidence_brief_text(evidence_items)}\n\n"
+                        "请用简洁中文输出最终答案、关键依据和下一步建议。"
+                    ),
+                },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 900,
+        },
+        timeout=settings.plan_react_llm_timeout_seconds,
+    )
+    response.raise_for_status()
+    return str(response.json()["choices"][0]["message"]["content"]).strip()
+
+
+def execute_plan_react_mcp(
+    db: Session,
+    request: TurnScopedRequest,
+    context: BuildContextResponse,
+    *,
+    on_plan: Callable[[PlanTasksResponse], None] | None = None,
+    on_step: Callable[[PlanExecutionStep], None] | None = None,
+) -> tuple[PlanTasksResponse, RetrieveResponse, AnswerResponse]:
+    del db
+    if not llm_available():
+        raise ValueError("plan_react_mcp requires LLM_PROVIDER=deepseek and a non-empty LLM_API_KEY.")
+    trace: list[PlanExecutionStep] = []
+    history: list[dict[str, object]] = []
+    evidence_items: list[EvidenceItem] = []
+
+    def append_step(step: PlanExecutionStep) -> None:
+        trace.append(step)
+        if on_step is not None:
+            on_step(step)
+
+    with create_plan_react_mcp_client() as client:
+        catalog = mcp_catalog_payload(client)
+        plan = llm_plan_react_plan(request, context, catalog)
+        if on_plan is not None:
+            on_plan(plan)
+        for task_index, task in enumerate(plan.tasks, start=1):
+            append_step(
+                PlanExecutionStep(
+                    step_id=f"{task.task_id}-start",
+                    task_id=task.task_id,
+                    title=f"Start node: {task.title}",
+                    action="plan_node_start",
+                    summary=f"{task.goal} 完成标准：{task.success_criteria}",
+                    metadata={"max_iterations": task.max_iterations, "node_index": task_index},
+                )
+            )
+            node_done = False
+            for iteration in range(1, max(task.max_iterations, 1) + 1):
+                decision = llm_plan_react_next_step(request, context, catalog, task, history)
+                action_metadata = {
+                    "thought": decision.thought,
+                    "server": decision.server,
+                    "capability_type": decision.capability_type,
+                    "name": decision.name,
+                    "arguments": decision.arguments,
+                    "is_done": decision.is_done,
+                    "answer_fragment": decision.answer_fragment,
+                }
+                append_step(
+                    PlanExecutionStep(
+                        step_id=f"{task.task_id}-react-{iteration}",
+                        task_id=task.task_id,
+                        title=f"ReAct action: {decision.action or 'stop'}",
+                        action="react_action",
+                        summary=(
+                            f"thought={decision.thought or '未提供'}; "
+                            f"action={decision.action or 'stop'}; "
+                            f"target={decision.server}.{decision.capability_type}:{decision.name}"
+                        ),
+                        metadata=action_metadata,
+                    )
+                )
+                history.append({"kind": "action", "task_id": task.task_id, "iteration": iteration, **action_metadata})
+                if decision.is_done or decision.action not in {"mcp_call", "tool", "call_tool", "resource", "prompt", "mcp"}:
+                    node_done = True
+                    append_step(
+                        PlanExecutionStep(
+                            step_id=f"{task.task_id}-complete-{iteration}",
+                            task_id=task.task_id,
+                            title=f"Complete node: {task.title}",
+                            action="plan_node_complete",
+                            summary=decision.answer_fragment or "当前节点已结束。",
+                            metadata={"reason": "is_done" if decision.is_done else "non_mcp_action"},
+                        )
+                    )
+                    history.append(
+                        {
+                            "kind": "node_complete",
+                            "task_id": task.task_id,
+                            "iteration": iteration,
+                            "answer_fragment": decision.answer_fragment,
+                        }
+                    )
+                    break
+                try:
+                    observation = execute_mcp_decision(client, catalog, decision)
+                except (MCPError, ValueError, TypeError) as exc:
+                    observation = PlanReactObservation(
+                        server=decision.server or "github",
+                        capability_type=decision.capability_type or "unknown",
+                        name=decision.name or "",
+                        summary=f"MCP 调用失败：{exc}",
+                        content=f"MCP 调用失败：{exc}",
+                        metadata={"error": str(exc)},
+                        status="failed",
+                    )
+                step_action = "blocked_tool" if observation.status == "blocked" else "mcp_observation"
+                step_status = "failed" if observation.status == "failed" else "completed"
+                step_id = f"{task.task_id}-observation-{iteration}"
+                if observation.status != "blocked":
+                    evidence_items.append(
+                        plan_react_evidence_item(
+                            request,
+                            observation,
+                            index=len(evidence_items) + 1,
+                            step_id=step_id,
+                        )
+                    )
+                history.append(
+                    {
+                        "kind": "observation",
+                        "task_id": task.task_id,
+                        "iteration": iteration,
+                        "server": observation.server,
+                        "capability_type": observation.capability_type,
+                        "name": observation.name,
+                        "summary": observation.summary,
+                        "content": observation.content[:1600],
+                        "metadata": observation.metadata,
+                        "status": observation.status,
+                    }
+                )
+                append_step(
+                    PlanExecutionStep(
+                        step_id=step_id,
+                        task_id=task.task_id,
+                        title=f"MCP observation: {observation.name}",
+                        action=step_action,
+                        summary=f"{observation.summary} {compact_text(observation.content, 220)}",
+                        status=step_status,
+                        evidence_labels=[item.label for item in evidence_items],
+                        metadata={
+                            "server": observation.server,
+                            "capability_type": observation.capability_type,
+                            "name": observation.name,
+                            "risk": observation.metadata.get("risk", ""),
+                            "blocked": observation.metadata.get("blocked", False),
+                            "observation_status": observation.status,
+                        },
+                    )
+                )
+            if not node_done:
+                append_step(
+                    PlanExecutionStep(
+                        step_id=f"{task.task_id}-max-iterations",
+                        task_id=task.task_id,
+                        title=f"Complete node: {task.title}",
+                        action="plan_node_complete",
+                        summary=f"节点达到最大循环次数 {task.max_iterations}，进入下一节点。",
+                        status="skipped",
+                        metadata={"reason": "max_iterations"},
+                    )
+                )
+        answer_text = llm_plan_react_final_answer(request, context, plan, history, evidence_items)
+        retrieval = RetrieveResponse(
+            project_id=request.project_id,
+            session_id=request.session_id,
+            sequence_id=request.sequence_id,
+            retrieval_mode="mcp_plan_react",
+            evidence_items=evidence_items,
+        )
+        answer = AnswerResponse(
+            project_id=request.project_id,
+            session_id=request.session_id,
+            sequence_id=request.sequence_id,
+            answer=answer_text,
+            citations=citations_from_evidence(evidence_items),
+        )
+        plan = plan.model_copy(
+            update={
+                "tasks": mark_tasks_completed(plan.tasks),
+                "execution_trace": trace,
+                "solver_summary": (
+                    f"Plan-ReAct-MCP 完成 {len(plan.tasks)} 个计划节点，"
+                    f"记录 {len([item for item in history if item.get('kind') == 'action'])} 次 ReAct 决策，"
+                    f"保留 {len(evidence_items)} 条 MCP 观察证据。"
+                ),
+                "replan_count": 0,
+                "replan_reason": "",
+            }
+        )
+        return plan, retrieval, answer
 
 
 _RESEARCH_SKILL_REGISTRY: dict[str, ResearchSkillSpec] = {}
@@ -3206,895 +3841,6 @@ def execute_agent_plan(
     return plan, retrieval, answer
 
 
-def lats_plan(request: TurnScopedRequest) -> PlanTasksResponse:
-    tasks = [
-        ResearchTask(
-            task_id="task-1",
-            title="Select node",
-            goal="用 UCB 在当前 Agent 决策树中选择最值得继续探索的节点。",
-            task_type="lats_select",
-            output_key="selected_node",
-        ),
-        ResearchTask(
-            task_id="task-2",
-            title="Expand actions",
-            goal="为选中节点生成候选工具动作或最终回答分支。",
-            task_type="lats_expand",
-            depends_on=["task-1"],
-            output_key="candidate_actions",
-        ),
-        ResearchTask(
-            task_id="task-3",
-            title="Act and evaluate",
-            goal="执行只读工具动作，基于 observation 评分并回传到树。",
-            task_type="lats_evaluate",
-            depends_on=["task-2"],
-            output_key="node_values",
-        ),
-        ResearchTask(
-            task_id="task-4",
-            title="Final answer",
-            goal="从最高价值路径综合工具观察并生成最终回答。",
-            task_type="synthesize",
-            depends_on=["task-3"],
-            output_key="final_answer",
-        ),
-    ]
-    return PlanTasksResponse(
-        project_id=request.project_id,
-        session_id=request.session_id,
-        sequence_id=request.sequence_id,
-        planner_mode="lats_agent_mcts",
-        plan_summary=(
-            f"LATS 使用 MCTS 在 Agent 工具决策树中搜索，预算为 {settings.lats_iterations} 次迭代、"
-            f"每次最多展开 {settings.lats_branching_factor} 个动作、深度上限 {settings.lats_max_depth}。"
-            "RAG 只是可选工具之一，不再作为 LATS 本身的搜索目标。"
-        ),
-        search_queries=[request.user_query],
-        tasks=tasks,
-    )
-
-
-def evidence_signature(item: EvidenceItem) -> tuple[str, str]:
-    return item.asset_id, item.chunk_id
-
-
-def dedupe_relabel_evidence(items: list[EvidenceItem]) -> list[EvidenceItem]:
-    deduped: list[EvidenceItem] = []
-    seen: set[tuple[str, str]] = set()
-    for item in items:
-        signature = evidence_signature(item)
-        if signature in seen:
-            continue
-        seen.add(signature)
-        deduped.append(item.model_copy(update={"label": f"C{len(deduped) + 1}"}))
-    return deduped[: settings.retrieval_limit]
-
-
-def lats_safe_actions() -> set[str]:
-    return {tool.name for tool in agent_tool_catalog() if tool.read_only} | {"final_answer"}
-
-
-def lats_tool_catalog_payload() -> list[dict[str, object]]:
-    safe_actions = lats_safe_actions()
-    payload = [
-        agent_tool_spec_payload(tool)
-        for tool in agent_tool_catalog()
-        if tool.name in safe_actions
-    ]
-    payload.append(
-        {
-            "name": "final_answer",
-            "description": "当已有 observation 足以回答，或确定不需要工具时结束搜索。",
-            "input_schema": {"answer": "最终回答，字符串"},
-        }
-    )
-    return payload
-
-
-def lats_history_actions(history: list[dict[str, object]]) -> list[str]:
-    return [str(item.get("action") or "") for item in history if item.get("kind") == "action"]
-
-
-def lats_observation_has_error(observation: AgentToolObservation | None) -> bool:
-    if observation is None:
-        return False
-    return bool(observation.metadata.get("error")) or "失败" in observation.summary
-
-
-def lats_observation_has_content(observation: AgentToolObservation | None) -> bool:
-    if observation is None or lats_observation_has_error(observation):
-        return False
-    empty_markers = ("没有命中", "当前没有", "暂无", "没有返回")
-    return bool(observation.evidence_items) or not any(marker in observation.content for marker in empty_markers)
-
-
-def lats_decision_key(decision: AgentDecision) -> str:
-    return json.dumps(
-        {"action": decision.action, "arguments": decision.arguments},
-        ensure_ascii=False,
-        sort_keys=True,
-        default=str,
-    )
-
-
-def lats_candidate(
-    thought: str,
-    action: str,
-    arguments: dict[str, object] | None = None,
-    prior: float = 0.5,
-) -> tuple[AgentDecision, float]:
-    return AgentDecision(thought=thought, action=action, arguments=arguments or {}), clamp_confidence(prior)
-
-
-def dedupe_lats_candidates(
-    candidates: list[tuple[AgentDecision, float]],
-    *,
-    limit: int,
-) -> list[tuple[AgentDecision, float]]:
-    deduped: list[tuple[AgentDecision, float]] = []
-    seen: set[str] = set()
-    for decision, prior in candidates:
-        decision = AgentDecision(
-            thought=decision.thought,
-            action=normalize_agent_action(decision.action),
-            arguments=decision.arguments,
-        )
-        if decision.action not in lats_safe_actions():
-            continue
-        key = lats_decision_key(decision)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append((decision, prior))
-        if len(deduped) >= limit:
-            break
-    return deduped
-
-
-def fallback_lats_candidate_actions(
-    request: TurnScopedRequest,
-    history: list[dict[str, object]],
-    *,
-    limit: int,
-) -> list[tuple[AgentDecision, float]]:
-    query = request.user_query
-    called_tools = set(lats_history_actions(history))
-    observations = [item for item in history if item.get("kind") == "observation"]
-    last_observation = observations[-1] if observations else {}
-    last_tool = str(last_observation.get("tool") or "")
-    last_content = str(last_observation.get("content") or "")
-    candidates: list[tuple[AgentDecision, float]] = []
-    concept_overview = is_concept_overview_query(query) and not is_memory_intent_query(query)
-
-    if observations:
-        has_success = any(not (isinstance(item.get("metadata"), dict) and item["metadata"].get("error")) for item in observations)
-        has_useful_content = has_success and not any(marker in last_content for marker in ("没有命中", "没有返回", "当前没有"))
-        memory_only_path = concept_overview and bool(called_tools) and called_tools <= {"memory_read"}
-        if has_useful_content and not memory_only_path:
-            candidates.append(
-                lats_candidate(
-                    "已有可用 observation，尝试结束并综合回答。",
-                    "final_answer",
-                    {"answer": summarize_agent_observations(history)},
-                    0.94,
-                )
-            )
-        if memory_only_path and "local_rag_search" not in called_tools:
-            candidates.append(
-                lats_candidate(
-                    "概念讲解不能只靠记忆，继续检索项目资料。",
-                    "local_rag_search",
-                    {"query": concept_overview_search_query(query)},
-                    0.82,
-                )
-            )
-        if last_tool == "local_rag_search" and "public_web_search" not in called_tools and settings.public_web_search_enabled:
-            candidates.append(
-                lats_candidate(
-                    "本地检索可能不足，尝试公开搜索补充。",
-                    "public_web_search",
-                    {"query": query},
-                    0.62,
-                )
-            )
-        if last_tool == "public_web_search" and "local_rag_search" not in called_tools:
-            candidates.append(
-                lats_candidate(
-                    "公开搜索不足，回到项目知识库查找。",
-                    "local_rag_search",
-                    {"query": query},
-                    0.7,
-                )
-            )
-        if "memory_read" not in called_tools and any(term in query for term in ("刚才", "之前", "记忆", "项目")):
-            candidates.append(lats_candidate("补充读取项目记忆。", "memory_read", {"query": query}, 0.58))
-        if not candidates:
-            candidates.append(
-                lats_candidate(
-                    "没有更好的只读工具分支，结束并说明当前观察。",
-                    "final_answer",
-                    {"answer": summarize_agent_observations(history)},
-                    0.5,
-                )
-            )
-        return dedupe_lats_candidates(candidates, limit=limit)
-
-    if "计算" in query or re.search(r"\d+\s*[-+*/%]", query):
-        candidates.append(lats_candidate("算术问题优先调用计算器。", "calculator", {"expression": extract_expression(query)}, 0.96))
-    if any(term in query for term in ("天气", "气温", "温度", "出游", "下雨", "降水")):
-        candidates.append(lats_candidate("需要实时天气事实。", "weather_lookup", {"query": query}, 0.9))
-    if wants_todo_list(query):
-        candidates.append(lats_candidate("用户询问 TODO 列表。", "todo_list", {}, 0.82))
-    if any(term in query for term in ("资产", "文档", "资料")):
-        candidates.append(lats_candidate("用户询问资产资料。", "asset_list", {}, 0.78))
-    if concept_overview:
-        candidates.append(
-            lats_candidate(
-                "概念讲解类问题优先检索项目资料，再综合成解释。",
-                "local_rag_search",
-                {"query": concept_overview_search_query(query)},
-                0.88,
-            )
-        )
-    if any(term in query for term in ("记忆", "刚才", "记住", "之前")):
-        candidates.append(lats_candidate("用户询问记忆内容。", "memory_read", {"query": query}, 0.8))
-    if settings.public_web_search_enabled and any(
-        term in query for term in ("联网", "搜索", "最新", "新闻", "官网", "公开资料", "今天", "今年", "现在", "当前", "年龄", "多大", "几岁")
-    ):
-        candidates.append(lats_candidate("问题可能需要公开或时效信息。", "public_web_search", {"query": query}, 0.74))
-    if not any(decision.action == "local_rag_search" for decision, _ in candidates):
-        candidates.append(lats_candidate("从项目知识库检索本地证据。", "local_rag_search", {"query": query}, 0.68))
-    return dedupe_lats_candidates(candidates, limit=limit)
-
-
-def llm_lats_candidate_actions(
-    request: TurnScopedRequest,
-    context: BuildContextResponse,
-    history: list[dict[str, object]],
-    *,
-    limit: int,
-) -> list[tuple[AgentDecision, float]]:
-    response = httpx.post(
-        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
-        headers=llm_headers(),
-        json={
-            "model": settings.llm_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是 LATS 的 expansion policy。只返回 JSON，不要 Markdown。"
-                        "为当前 Agent 状态提出多个可比较的下一步动作。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "可用只读/无副作用工具：\n"
-                        f"{json.dumps(lats_tool_catalog_payload(), ensure_ascii=False)}\n\n"
-                        "输出 JSON schema：\n"
-                        "{"
-                        '"actions": ['
-                        '{"thought": "简短理由", "action": "工具名或 final_answer", '
-                        '"arguments": {"参数": "值"}, "prior": 0.0}'
-                        "]"
-                        "}\n\n"
-                        "约束：\n"
-                        "- 不要选择 memory_write 或 todo_create，这些有副作用。\n"
-                        "- 每个动作必须互相有差异，便于树搜索比较。\n"
-                        "- 有 observation 且足够回答时，包含 final_answer 分支。\n"
-                        "- 工具失败或证据不足时，提出替代工具分支。\n\n"
-                        "- 对“讲一讲/介绍/概述/是什么”等概念讲解问题，优先 local_rag_search，"
-                        "query 应覆盖主题、定义、原理、应用。\n"
-                        "- 除非用户明确询问刚才/之前/记忆/历史对话，不要把 memory_read 作为概念讲解问题的根分支或终止依据。\n\n"
-                        f"用户问题：{request.user_query}\n\n"
-                        f"项目上下文预览：\n{context.packed_context[:2200]}\n\n"
-                        f"当前路径历史：\n{agent_history_text(history)}\n\n"
-                        f"最多返回 {limit} 个动作。"
-                    ),
-                },
-            ],
-            "temperature": 0.4,
-            "max_tokens": 900,
-        },
-        timeout=60.0,
-    )
-    response.raise_for_status()
-    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
-    raw_actions = payload.get("actions") or []
-    if not isinstance(raw_actions, list):
-        raise ValueError("LATS expansion policy did not return an actions list")
-    candidates: list[tuple[AgentDecision, float]] = []
-    for item in raw_actions:
-        if not isinstance(item, dict):
-            continue
-        decision = agent_decision_from_payload(item)
-        candidates.append((decision, clamp_confidence(item.get("prior", 0.5))))
-    return dedupe_lats_candidates(candidates, limit=limit)
-
-
-def lats_candidate_actions(
-    request: TurnScopedRequest,
-    context: BuildContextResponse,
-    history: list[dict[str, object]],
-    *,
-    limit: int,
-) -> list[tuple[AgentDecision, float]]:
-    candidates: list[tuple[AgentDecision, float]] = []
-    if llm_available():
-        try:
-            candidates.extend(llm_lats_candidate_actions(request, context, history, limit=limit))
-        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("llm_lats_candidate_actions_failed error=%s", exc)
-    candidates.extend(fallback_lats_candidate_actions(request, history, limit=limit))
-    if is_concept_overview_query(request.user_query) and not is_memory_intent_query(request.user_query):
-        adjusted: list[tuple[AgentDecision, float]] = []
-        for decision, prior in candidates:
-            if decision.action == "memory_read":
-                continue
-            if not history and decision.action == "final_answer":
-                continue
-            adjusted.append((decision, prior))
-        candidates = adjusted
-    return dedupe_lats_candidates(candidates, limit=limit)
-
-
-def lats_decision_summary(decision: AgentDecision) -> str:
-    return (
-        f"thought={decision.thought or '未提供'}; action={decision.action}; "
-        f"args={json.dumps(decision.arguments, ensure_ascii=False, default=str)}"
-    )
-
-
-def lats_ucb_score(parent: LatsAgentNode, child: LatsAgentNode) -> float:
-    if child.visits <= 0:
-        return float("inf")
-    exploitation = child.value_sum / child.visits
-    exploration = math.sqrt(math.log(max(parent.visits, 1) + 1) / child.visits)
-    return exploitation + 1.414 * exploration + 0.1 * child.prior
-
-
-def lats_select_leaf(root: LatsAgentNode) -> LatsAgentNode:
-    node = root
-    while node.children and not node.terminal and node.depth < max(settings.lats_max_depth, 1):
-        node = max(node.children, key=lambda child: lats_ucb_score(node, child))
-    return node
-
-
-def lats_backpropagate(node: LatsAgentNode, value: float) -> None:
-    current: LatsAgentNode | None = node
-    while current is not None:
-        current.visits += 1
-        current.value_sum += value
-        current = current.parent
-
-
-def lats_path(node: LatsAgentNode) -> list[LatsAgentNode]:
-    path: list[LatsAgentNode] = []
-    current: LatsAgentNode | None = node
-    while current is not None:
-        path.append(current)
-        current = current.parent
-    return list(reversed(path))
-
-
-def lats_node_average(node: LatsAgentNode) -> float:
-    return node.value_sum / node.visits if node.visits else node.score
-
-
-def lats_all_nodes(root: LatsAgentNode) -> list[LatsAgentNode]:
-    nodes = [root]
-    for child in root.children:
-        nodes.extend(lats_all_nodes(child))
-    return nodes
-
-
-def execute_lats_decision(
-    db: Session,
-    request: TurnScopedRequest,
-    context: BuildContextResponse,
-    *,
-    parent: LatsAgentNode,
-    decision: AgentDecision,
-    prior: float,
-    child_index: int,
-) -> LatsAgentNode:
-    history = list(parent.history)
-    step_number = len([item for item in history if item.get("kind") == "action"]) + 1
-    history.append(
-        {
-            "kind": "action",
-            "step": step_number,
-            "thought": decision.thought,
-            "action": decision.action,
-            "arguments": decision.arguments,
-        }
-    )
-    node = LatsAgentNode(
-        node_id=f"{parent.node_id}.{child_index}" if parent.parent is not None else f"n{child_index}",
-        parent=parent,
-        depth=parent.depth + 1,
-        history=history,
-        decision=decision,
-        evidence_items=list(parent.evidence_items),
-        prior=prior,
-    )
-    if decision.action == "final_answer":
-        answer_text = str(decision.arguments.get("answer") or summarize_agent_observations(parent.history))
-        node.history.append({"kind": "final", "step": step_number, "content": answer_text})
-        node.terminal = True
-        return node
-    try:
-        observation = execute_agent_tool(db, request, context, decision)
-        evidence_items = dedupe_relabel_evidence([*parent.evidence_items, *observation.evidence_items])
-    except (httpx.HTTPError, ValueError, ZeroDivisionError) as exc:
-        observation = AgentToolObservation(
-            tool_name=decision.action,
-            summary=f"工具调用失败：{exc}",
-            content=f"工具 {decision.action} 调用失败：{exc}",
-            evidence_items=[],
-            metadata={"error": str(exc)},
-        )
-        evidence_items = list(parent.evidence_items)
-    node.observation = observation
-    node.evidence_items = evidence_items
-    node.history.append(
-        {
-            "kind": "observation",
-            "step": step_number,
-            "tool": observation.tool_name,
-            "summary": observation.summary,
-            "content": observation.content[:1200],
-            "metadata": observation.metadata,
-            "evidence_labels": [item.label for item in evidence_items],
-        }
-    )
-    return node
-
-
-def lats_query_overlap_score(query: str, text: str) -> float:
-    terms = [
-        token.lower()
-        for token in re.findall(r"[A-Za-z0-9_./+-]+|[\u4e00-\u9fff]{2,}", query)
-        if token.strip()
-    ]
-    if not terms:
-        return 0.0
-    lowered = text.lower()
-    overlap = sum(1 for term in terms if term in lowered)
-    return min(overlap / max(len(terms), 1), 1.0)
-
-
-def heuristic_lats_evaluation(request: TurnScopedRequest, node: LatsAgentNode) -> tuple[float, bool, str]:
-    if node.decision is None:
-        return 0.0, False, "root 节点尚未执行动作。"
-    if node.decision.action == "final_answer":
-        answer = str(node.decision.arguments.get("answer") or "")
-        if contains_restrictive_fallback_text(answer):
-            return 0.15, True, "final_answer 含限制性失败话术，价值较低。"
-        inherited = lats_node_average(node.parent) if node.parent else 0.25
-        score = max(0.25, min(1.0, inherited + (0.08 if answer.strip() else 0.0)))
-        return score, True, "final_answer 结束路径，继承并小幅奖励已有 observation 价值。"
-    observation = node.observation
-    if observation is None:
-        return 0.05, False, "动作没有产生 observation。"
-    if lats_observation_has_error(observation):
-        return 0.04, False, "工具调用失败，该分支降权。"
-    content = f"{observation.summary}\n{observation.content}"
-    overlap_bonus = 0.12 * lats_query_overlap_score(request.user_query, content)
-    action = node.decision.action
-    if action == "calculator":
-        return 0.96, True, "calculator 成功返回确定性计算结果。"
-    if action == "local_rag_search":
-        if not observation.evidence_items:
-            return 0.12, False, "本地 RAG 没有命中证据，可尝试其他工具。"
-        top_score = max(item.score for item in observation.evidence_items)
-        score = min(0.92, 0.35 + 0.08 * min(len(observation.evidence_items), 5) + 0.08 * min(top_score, 2.0) + overlap_bonus)
-        return score, False, "本地 RAG 命中证据，按证据数、最高分和问题重叠评分。"
-    if action in {"weather_lookup", "public_web_search"}:
-        if not lats_observation_has_content(observation):
-            return 0.18, False, f"{action} 没有返回可用内容。"
-        score = min(0.88, 0.58 + 0.08 * min(len(observation.evidence_items), 3) + overlap_bonus)
-        return score, False, f"{action} 返回可用外部 observation。"
-    if action in {"memory_read", "todo_list", "asset_list"}:
-        if not lats_observation_has_content(observation):
-            return 0.22, False, f"{action} 返回为空。"
-        return min(0.72, 0.52 + overlap_bonus), False, f"{action} 返回可用项目状态。"
-    return 0.3 + overlap_bonus, False, "未知只读动作按弱可用分支处理。"
-
-
-def llm_lats_evaluate_node(request: TurnScopedRequest, node: LatsAgentNode) -> tuple[float, bool, str]:
-    response = httpx.post(
-        f"{settings.llm_api_base.rstrip('/')}/chat/completions",
-        headers=llm_headers(),
-        json={
-            "model": settings.llm_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是 LATS 的 value/reflection evaluator。只返回 JSON，不要 Markdown。"
-                        "根据当前路径对是否接近回答用户问题打分。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "输出 JSON schema："
-                        '{"score": 0.0, "terminal": false, "reflection": "简短反思"}\n\n'
-                        "评分要求：0 表示无用或失败，1 表示可以可靠回答。"
-                        "不要因为工具名本身打高分，要看 observation 是否回答了用户问题。\n\n"
-                        "对“讲一讲/介绍/概述/是什么”等概念讲解问题，纯 memory_read 分支不能视为可靠终止；"
-                        "应优先奖励 RAG/公开资料证据加最终综合。\n\n"
-                        f"用户问题：{request.user_query}\n\n"
-                        f"当前路径：\n{agent_history_text(node.history)}"
-                    ),
-                },
-            ],
-            "temperature": 0,
-            "max_tokens": 500,
-        },
-        timeout=60.0,
-    )
-    response.raise_for_status()
-    payload = json.loads(extract_json_object(str(response.json()["choices"][0]["message"]["content"]).strip()))
-    score = clamp_confidence(payload.get("score", 0.0))
-    terminal = planner_truthy(payload.get("terminal", False))
-    reflection = compact_text(str(payload.get("reflection") or ""), 300)
-    return score, terminal, reflection
-
-
-def adjust_lats_evaluation(
-    request: TurnScopedRequest,
-    node: LatsAgentNode,
-    score: float,
-    terminal: bool,
-    reflection: str,
-) -> tuple[float, bool, str]:
-    if (
-        node.decision
-        and is_concept_overview_query(request.user_query)
-        and not is_memory_intent_query(request.user_query)
-    ):
-        if node.decision.action == "memory_read":
-            return (
-                min(score, 0.35),
-                False,
-                compact_text(f"{reflection} 概念讲解不能只依赖项目记忆，需要检索资料或最终综合。", 300),
-            )
-        if node.decision.action == "final_answer" and not node.evidence_items and len(lats_history_actions(node.history)) <= 1:
-            return (
-                min(score, 0.35),
-                terminal,
-                compact_text(f"{reflection} 根节点直接回答缺少资料支撑，降权。", 300),
-            )
-    return score, terminal, reflection
-
-
-def lats_evaluate_node(request: TurnScopedRequest, node: LatsAgentNode) -> tuple[float, bool, str]:
-    if llm_available():
-        try:
-            score, terminal, reflection = llm_lats_evaluate_node(request, node)
-            return adjust_lats_evaluation(request, node, score, terminal, reflection)
-        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("llm_lats_evaluate_node_failed error=%s", exc)
-    score, terminal, reflection = heuristic_lats_evaluation(request, node)
-    return adjust_lats_evaluation(request, node, score, terminal, reflection)
-
-
-def best_lats_node(root: LatsAgentNode) -> LatsAgentNode:
-    candidates = [node for node in lats_all_nodes(root) if node.parent is not None]
-    if not candidates:
-        return root
-    return max(candidates, key=lambda node: (lats_node_average(node), node.score, node.visits, node.prior))
-
-
-def lats_search_queries_from_history(history: list[dict[str, object]]) -> list[str]:
-    queries: list[str] = []
-    for item in history:
-        if item.get("kind") != "action":
-            continue
-        arguments = item.get("arguments")
-        if isinstance(arguments, dict):
-            query = str(arguments.get("query") or "").strip()
-            if query:
-                queries.append(query)
-    return dedupe_preserve_order(queries)
-
-
-def lats_node_tree_payload(
-    node: LatsAgentNode,
-    *,
-    best_path_ids: set[str],
-) -> dict[str, object]:
-    decision = node.decision
-    observation = node.observation
-    return {
-        "id": node.node_id,
-        "parent_id": node.parent.node_id if node.parent else "",
-        "depth": node.depth,
-        "action": decision.action if decision else "root",
-        "skill": agent_tool_registry().get(decision.action).skill if decision and decision.action in agent_tool_registry() else "",
-        "thought": decision.thought if decision else "LATS root",
-        "arguments": decision.arguments if decision else {},
-        "observation_tool": observation.tool_name if observation else "",
-        "observation_summary": observation.summary if observation else "",
-        "score": round(node.score, 4),
-        "visits": node.visits,
-        "value_sum": round(node.value_sum, 4),
-        "average_value": round(lats_node_average(node), 4),
-        "prior": round(node.prior, 4),
-        "terminal": node.terminal,
-        "best_path": node.node_id in best_path_ids,
-        "reflection": node.reflection,
-        "evidence_labels": [item.label for item in node.evidence_items],
-        "children": [
-            lats_node_tree_payload(child, best_path_ids=best_path_ids)
-            for child in sorted(node.children, key=lambda child: (child.depth, child.node_id))
-        ],
-    }
-
-
-def lats_trace_tree_payload(
-    root: LatsAgentNode,
-    best_node: LatsAgentNode,
-    *,
-    iterations: int,
-    expanded_count: int,
-) -> dict[str, object]:
-    best_path = lats_path(best_node)
-    best_path_ids = {node.node_id for node in best_path}
-    return {
-        "kind": "lats_agent_mcts",
-        "root_id": root.node_id,
-        "best_node_id": best_node.node_id,
-        "best_path": [node.node_id for node in best_path],
-        "best_actions": [node.decision.action for node in best_path if node.decision is not None],
-        "iterations": iterations,
-        "expanded_count": expanded_count,
-        "node_count": len(lats_all_nodes(root)),
-        "root": lats_node_tree_payload(root, best_path_ids=best_path_ids),
-    }
-
-
-def execute_lats_agent_plan(
-    db: Session,
-    request: TurnScopedRequest,
-    context: BuildContextResponse,
-    *,
-    on_step: Callable[[PlanExecutionStep], None] | None = None,
-) -> tuple[PlanTasksResponse, RetrieveResponse, AnswerResponse]:
-    plan = lats_plan(request)
-    trace: list[PlanExecutionStep] = []
-    root = LatsAgentNode(node_id="root", parent=None, depth=0, history=[])
-
-    def append_step(step: PlanExecutionStep) -> None:
-        trace.append(step)
-        if on_step is not None:
-            on_step(step)
-
-    branch_factor = max(1, settings.lats_branching_factor)
-    max_depth = max(1, settings.lats_max_depth)
-    iterations = max(1, settings.lats_iterations)
-    expanded_count = 0
-
-    for iteration in range(1, iterations + 1):
-        leaf = lats_select_leaf(root)
-        append_step(
-            PlanExecutionStep(
-                step_id=f"lats-iter-{iteration}-select",
-                task_id="task-1",
-                title="LATS select node",
-                action="lats_select",
-                summary=(
-                    f"iteration={iteration}; selected={leaf.node_id}; depth={leaf.depth}; "
-                    f"visits={leaf.visits}; avg={lats_node_average(leaf):.4f}。"
-                ),
-                evidence_labels=[item.label for item in leaf.evidence_items],
-            )
-        )
-        if leaf.terminal or leaf.depth >= max_depth:
-            score, terminal, reflection = lats_evaluate_node(request, leaf)
-            leaf.score = score
-            leaf.terminal = leaf.terminal or terminal
-            leaf.reflection = reflection
-            lats_backpropagate(leaf, score)
-            append_step(
-                PlanExecutionStep(
-                    step_id=f"lats-iter-{iteration}-backprop",
-                    task_id="task-3",
-                    title="LATS backpropagate",
-                    action="lats_backprop",
-                    summary=f"leaf={leaf.node_id}; score={score:.4f}; reflection={reflection}",
-                    evidence_labels=[item.label for item in leaf.evidence_items],
-                )
-            )
-            continue
-
-        candidates = lats_candidate_actions(request, context, leaf.history, limit=branch_factor)
-        append_step(
-            PlanExecutionStep(
-                step_id=f"lats-iter-{iteration}-expand",
-                task_id="task-2",
-                title="LATS expand actions",
-                action="lats_expand",
-                summary=(
-                    f"从节点 {leaf.node_id} 展开 {len(candidates)} 个候选动作："
-                    f"{', '.join(decision.action for decision, _ in candidates)}"
-                ),
-                search_queries=lats_search_queries_from_history(leaf.history),
-                evidence_labels=[item.label for item in leaf.evidence_items],
-            )
-        )
-        existing_child_keys = {lats_decision_key(child.decision) for child in leaf.children if child.decision is not None}
-        for candidate_index, (decision, prior) in enumerate(candidates, start=1):
-            if lats_decision_key(decision) in existing_child_keys:
-                continue
-            child = execute_lats_decision(
-                db,
-                request,
-                context,
-                parent=leaf,
-                decision=decision,
-                prior=prior,
-                child_index=len(leaf.children) + 1,
-            )
-            leaf.children.append(child)
-            expanded_count += 1
-            append_step(
-                PlanExecutionStep(
-                    step_id=f"lats-{child.node_id}-action",
-                    task_id="task-2",
-                    title=f"LATS action: {decision.action}",
-                    action="lats_action",
-                    summary=f"parent={leaf.node_id}; prior={prior:.2f}; {lats_decision_summary(decision)}",
-                    search_queries=lats_search_queries_from_history(child.history),
-                    evidence_labels=[item.label for item in leaf.evidence_items],
-                )
-            )
-            if child.observation is not None:
-                append_step(
-                    PlanExecutionStep(
-                        step_id=f"lats-{child.node_id}-observation",
-                        task_id="task-3",
-                        title=f"LATS observation: {child.observation.tool_name}",
-                        action="lats_observation",
-                        summary=f"{child.observation.summary} {compact_text(child.observation.content, 240)}",
-                        status="failed" if lats_observation_has_error(child.observation) else "completed",
-                        evidence_labels=[item.label for item in child.evidence_items],
-                    )
-                )
-            score, terminal, reflection = lats_evaluate_node(request, child)
-            child.score = score
-            child.terminal = child.terminal or terminal
-            child.reflection = reflection
-            append_step(
-                PlanExecutionStep(
-                    step_id=f"lats-{child.node_id}-evaluate",
-                    task_id="task-3",
-                    title="LATS evaluate node",
-                    action="lats_evaluate",
-                    summary=f"node={child.node_id}; score={score:.4f}; terminal={child.terminal}; reflection={reflection}",
-                    evidence_labels=[item.label for item in child.evidence_items],
-                )
-            )
-            lats_backpropagate(child, score)
-            append_step(
-                PlanExecutionStep(
-                    step_id=f"lats-{child.node_id}-backprop",
-                    task_id="task-3",
-                    title="LATS backpropagate",
-                    action="lats_backprop",
-                    summary=(
-                        f"node={child.node_id}; propagated={score:.4f}; "
-                        f"node_visits={child.visits}; root_visits={root.visits}"
-                    ),
-                    evidence_labels=[item.label for item in child.evidence_items],
-                )
-            )
-
-    best_node = best_lats_node(root)
-    final_evidence = best_node.evidence_items
-    best_path = lats_path(best_node)
-    path_actions = [node.decision.action for node in best_path if node.decision is not None]
-    trace_tree = lats_trace_tree_payload(
-        root,
-        best_node,
-        iterations=iterations,
-        expanded_count=expanded_count,
-    )
-    append_step(
-        PlanExecutionStep(
-            step_id="lats-final-select",
-            task_id="task-4",
-            title="LATS final path",
-            action="lats_final",
-            summary=(
-                f"选择路径 {' -> '.join(path_actions) or 'none'}；"
-                f"best_node={best_node.node_id}; avg={lats_node_average(best_node):.4f}; "
-                f"visits={best_node.visits}; expanded={expanded_count}。"
-            ),
-            evidence_labels=[item.label for item in final_evidence],
-        )
-    )
-
-    final_text = ""
-    if best_node.decision and best_node.decision.action == "final_answer":
-        final_text = str(best_node.decision.arguments.get("answer") or "")
-    if final_text.strip():
-        answer_text = final_text.strip()
-    else:
-        answer_text, synthesized = synthesize_agent_answer(
-            request,
-            mode="lats_agent_mcts",
-            final_text="",
-            history=best_node.history,
-            evidence_items=final_evidence,
-        )
-        append_step(
-            PlanExecutionStep(
-                step_id="lats-final-synthesis",
-                task_id="task-4",
-                title="LATS final synthesis" if synthesized else "LATS final fallback",
-                action="lats_final",
-                summary=compact_text(answer_text, 260),
-                evidence_labels=[item.label for item in final_evidence],
-            )
-        )
-    direct_fallback_used = False
-    if agent_should_use_direct_llm_fallback(answer_text, best_node.history, final_evidence):
-        fallback = try_direct_llm_answer(
-            request,
-            reason="LATS agent tree search did not produce usable evidence or answer",
-            packed_context=context.packed_context,
-            observations=best_node.history,
-        )
-        if fallback:
-            answer_text = fallback
-            direct_fallback_used = True
-            append_step(
-                PlanExecutionStep(
-                    step_id="lats-direct-llm-fallback",
-                    task_id="task-4",
-                    title="LATS direct LLM fallback",
-                    action="lats_final",
-                    summary=compact_text(answer_text, 260),
-                    evidence_labels=[],
-                )
-            )
-    retrieval = RetrieveResponse(
-        project_id=request.project_id,
-        session_id=request.session_id,
-        sequence_id=request.sequence_id,
-        retrieval_mode="lats_agent_mcts",
-        evidence_items=final_evidence,
-    )
-    answer = AnswerResponse(
-        project_id=request.project_id,
-        session_id=request.session_id,
-        sequence_id=request.sequence_id,
-        answer=answer_text,
-        citations=[] if direct_fallback_used else citations_from_evidence(final_evidence),
-    )
-    plan = plan.model_copy(
-        update={
-            "tasks": mark_tasks_completed(plan.tasks),
-            "execution_trace": trace,
-            "solver_summary": (
-                f"LATS/MCTS 完成 {iterations} 次迭代，展开 {expanded_count} 个 Agent 动作节点；"
-                f"最佳路径 {' -> '.join(path_actions) or 'none'}，"
-                f"平均价值 {lats_node_average(best_node):.4f}，保留 {len(final_evidence)} 条证据。"
-            ),
-            "replan_count": expanded_count,
-            "replan_reason": "MCTS 通过 selection/expansion/evaluation/backpropagation 反复重估工具路径。",
-            "search_queries": dedupe_preserve_order([request.user_query, *lats_search_queries_from_history(best_node.history)]),
-            "trace_tree": trace_tree,
-        }
-    )
-    return plan, retrieval, answer
-
-
 def live_tool_catalog() -> list[dict[str, object]]:
     catalog: list[dict[str, object]] = [
         {
@@ -4565,6 +4311,59 @@ def consolidate_memory(
     )
 
 
+def append_memory_updates_to_run(
+    db: Session,
+    project_id: str,
+    session_id: str,
+    sequence_id: int,
+    updates: list[MemoryItem],
+) -> None:
+    if not updates:
+        return
+    run = db.scalar(
+        select(ResearchRun).where(
+            ResearchRun.project_id == project_id,
+            ResearchRun.session_id == session_id,
+            ResearchRun.sequence_id == sequence_id,
+        )
+    )
+    if run is None:
+        return
+    current = ConsolidateMemoryResponse(**run.memory_payload)
+    run.memory_payload = current.model_copy(
+        update={"memory_updates": current.memory_updates + updates}
+    ).model_dump()
+    db.commit()
+
+
+def run_long_term_memory_maintenance(project_id: str, session_id: str, sequence_id: int) -> None:
+    db = SessionLocal()
+    try:
+        updates = consolidate_long_term_memories(db, project_id, session_id, sequence_id)
+        append_memory_updates_to_run(db, project_id, session_id, sequence_id, updates)
+        if updates:
+            db.commit()
+    except Exception as exc:  # pragma: no cover - background safety net
+        db.rollback()
+        logger.warning(
+            "long_term_memory_maintenance_failed project_id=%s session_id=%s sequence_id=%s error=%s",
+            project_id,
+            session_id,
+            sequence_id,
+            exc,
+        )
+    finally:
+        db.close()
+
+
+def start_long_term_memory_maintenance(project_id: str, session_id: str, sequence_id: int) -> None:
+    threading.Thread(
+        target=run_long_term_memory_maintenance,
+        args=(project_id, session_id, sequence_id),
+        daemon=True,
+    ).start()
+
+
 def run_research(db: Session, request: TurnScopedRequest) -> RunResearchResponse:
     project = get_project(db, request.project_id)
     session = get_chat_session(db, request.project_id, request.session_id)
@@ -4572,28 +4371,33 @@ def run_research(db: Session, request: TurnScopedRequest) -> RunResearchResponse
     ensure_next_sequence(session, request.sequence_id)
     assets = resolve_assets(db)
     context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
-    tool_decision = choose_live_tool(request, context)
-    live_route = tool_decision.route
-    if live_route is not None:
-        plan, retrieval, answer = execute_live_tool_plan(request, live_route)
+    tool_decision = ToolPlannerDecision(None, "plan_react_mcp", "default Plan-ReAct-MCP execution")
+    live_route: LiveToolRoute | None = None
+    if settings.execution_mode == "plan_react_mcp":
+        plan, retrieval, answer = execute_plan_react_mcp(db, request, context)
     else:
-        plan = plan_tasks(request, todo=todo)
-        plan, retrieval = execute_plan(request, todo=todo, plan=plan, assets=assets)
-        answer = answer_with_citations(
-            AnswerWithCitationsRequest(
-                project_id=request.project_id,
-                session_id=request.session_id,
-                sequence_id=request.sequence_id,
-                user_query=request.user_query,
-                asset_ids=request.asset_ids,
-                todo_id=request.todo_id,
-                evidence_items=retrieval.evidence_items,
-                plan_summary=plan.plan_summary,
-                plan_tasks=plan.tasks,
-                execution_trace=plan.execution_trace,
-                packed_context=context.packed_context,
+        tool_decision = choose_live_tool(request, context)
+        live_route = tool_decision.route
+        if live_route is not None:
+            plan, retrieval, answer = execute_live_tool_plan(request, live_route)
+        else:
+            plan = plan_tasks(request, todo=todo)
+            plan, retrieval = execute_plan(request, todo=todo, plan=plan, assets=assets)
+            answer = answer_with_citations(
+                AnswerWithCitationsRequest(
+                    project_id=request.project_id,
+                    session_id=request.session_id,
+                    sequence_id=request.sequence_id,
+                    user_query=request.user_query,
+                    asset_ids=request.asset_ids,
+                    todo_id=request.todo_id,
+                    evidence_items=retrieval.evidence_items,
+                    plan_summary=plan.plan_summary,
+                    plan_tasks=plan.tasks,
+                    execution_trace=plan.execution_trace,
+                    packed_context=context.packed_context,
+                )
             )
-        )
     memory = consolidate_memory(
         db,
         ConsolidateMemoryRequest(
@@ -4706,63 +4510,6 @@ def run_agent_research(db: Session, request: TurnScopedRequest) -> RunResearchRe
     )
 
 
-def run_lats_research(db: Session, request: TurnScopedRequest) -> RunResearchResponse:
-    project = get_project(db, request.project_id)
-    session = get_chat_session(db, request.project_id, request.session_id)
-    todo = get_project_todo(db, project.id, request.todo_id) if request.todo_id else None
-    ensure_next_sequence(session, request.sequence_id)
-    assets = resolve_assets(db)
-    context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
-    plan, retrieval, answer = execute_lats_agent_plan(db, request, context)
-    memory = consolidate_memory(
-        db,
-        ConsolidateMemoryRequest(
-            project_id=request.project_id,
-            session_id=request.session_id,
-            sequence_id=request.sequence_id,
-            user_query=request.user_query,
-            asset_ids=request.asset_ids,
-            todo_id=request.todo_id,
-            answer=answer.answer,
-            citations=answer.citations,
-        ),
-        todo=todo,
-    )
-    answer = attach_answer_quality(plan, retrieval, answer, memory)
-    trace_id = f"trace-{uuid.uuid4().hex[:12]}"
-    persist_research_run(
-        db,
-        project=project,
-        session=session,
-        request=request,
-        context=context,
-        plan=plan,
-        retrieval=retrieval,
-        answer=answer,
-        memory=memory,
-        todo=todo,
-        trace_id=trace_id,
-    )
-    return RunResearchResponse(
-        project_id=project.id,
-        session_id=session.id,
-        sequence_id=request.sequence_id,
-        context=context,
-        plan=plan,
-        retrieval=retrieval,
-        answer=answer,
-        memory=memory,
-        trace_id=trace_id,
-        meta={
-            "mode": "lats_agent_mcts",
-            "planner_mode": plan.planner_mode,
-            "lats_branching_factor": settings.lats_branching_factor,
-            "lats_max_depth": settings.lats_max_depth,
-            "lats_iterations": settings.lats_iterations,
-        },
-    )
-
-
 def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[dict[str, object]]:
     project = get_project(db, request.project_id)
     session = get_chat_session(db, request.project_id, request.session_id)
@@ -4770,6 +4517,82 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
     ensure_next_sequence(session, request.sequence_id)
     assets = resolve_assets(db)
     context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
+    if settings.execution_mode == "plan_react_mcp":
+        stream_queue: queue.Queue[dict[str, object] | BaseException] = queue.Queue()
+        result: dict[str, tuple[PlanTasksResponse, RetrieveResponse, AnswerResponse]] = {}
+
+        def enqueue_plan(plan_event: PlanTasksResponse) -> None:
+            stream_queue.put({"type": "plan", "plan": plan_event.model_dump(mode="json")})
+
+        def enqueue_step(step_event: PlanExecutionStep) -> None:
+            stream_queue.put({"type": "trace", "step": step_event.model_dump(mode="json")})
+
+        def run_plan_react_worker() -> None:
+            try:
+                result["payload"] = execute_plan_react_mcp(
+                    db,
+                    request,
+                    context,
+                    on_plan=enqueue_plan,
+                    on_step=enqueue_step,
+                )
+            except BaseException as exc:  # noqa: BLE001 - propagate worker errors through the stream iterator.
+                stream_queue.put(exc)
+            finally:
+                stream_queue.put({"type": "_plan_react_done"})
+
+        worker = threading.Thread(target=run_plan_react_worker, daemon=True)
+        worker.start()
+        while True:
+            stream_item = stream_queue.get()
+            if isinstance(stream_item, BaseException):
+                worker.join(timeout=1.0)
+                raise stream_item
+            if stream_item.get("type") == "_plan_react_done":
+                break
+            yield stream_item
+        worker.join(timeout=1.0)
+        plan, retrieval, answer = result["payload"]
+        yield {
+            "type": "solver_summary",
+            "solver_summary": plan.solver_summary,
+            "replan_count": plan.replan_count,
+            "replan_reason": plan.replan_reason,
+        }
+        yield {"type": "answer_delta", "delta": answer.answer, "answer": answer.answer}
+        memory = consolidate_memory(
+            db,
+            ConsolidateMemoryRequest(
+                project_id=request.project_id,
+                session_id=request.session_id,
+                sequence_id=request.sequence_id,
+                user_query=request.user_query,
+                asset_ids=request.asset_ids,
+                todo_id=request.todo_id,
+                answer=answer.answer,
+                citations=answer.citations,
+            ),
+            todo=todo,
+        )
+        answer = attach_answer_quality(plan, retrieval, answer, memory)
+        yield {"type": "answer_quality", "quality": answer.quality.model_dump(mode="json")}
+        trace_id = f"trace-{uuid.uuid4().hex[:12]}"
+        run = persist_research_run(
+            db,
+            project=project,
+            session=session,
+            request=request,
+            context=context,
+            plan=plan,
+            retrieval=retrieval,
+            answer=answer,
+            memory=memory,
+            todo=todo,
+            trace_id=trace_id,
+        )
+        yield {"type": "complete", "run": run_to_detail(run).model_dump(mode="json")}
+        start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
+        return
     tool_decision = choose_live_tool(request, context)
     live_route = tool_decision.route
     if live_route is not None:
@@ -4824,6 +4647,7 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
             "type": "complete",
             "run": run_to_detail(run).model_dump(mode="json"),
         }
+        start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
         return
     plan = plan_tasks(request, todo=todo)
     yield {"type": "plan", "plan": plan.model_dump(mode="json")}
@@ -4905,6 +4729,7 @@ def stream_research_events(db: Session, request: TurnScopedRequest) -> Iterator[
         "type": "complete",
         "run": run_to_detail(run).model_dump(mode="json"),
     }
+    start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
 
 
 def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dict[str, object]]:
@@ -4920,8 +4745,6 @@ def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dic
     plan, retrieval, answer = execute_agent_plan(db, request, context, on_step=trace_events.append)
     for step in trace_events:
         yield {"type": "trace", "step": step.model_dump(mode="json")}
-    if plan.trace_tree:
-        yield {"type": "trace_tree", "trace_tree": plan.trace_tree}
     yield {
         "type": "solver_summary",
         "solver_summary": plan.solver_summary,
@@ -4960,66 +4783,7 @@ def stream_agent_events(db: Session, request: TurnScopedRequest) -> Iterator[dic
         trace_id=trace_id,
     )
     yield {"type": "complete", "run": run_to_detail(run).model_dump(mode="json")}
-
-
-def stream_lats_events(db: Session, request: TurnScopedRequest) -> Iterator[dict[str, object]]:
-    project = get_project(db, request.project_id)
-    session = get_chat_session(db, request.project_id, request.session_id)
-    todo = get_project_todo(db, project.id, request.todo_id) if request.todo_id else None
-    ensure_next_sequence(session, request.sequence_id)
-    assets = resolve_assets(db)
-    context = build_context(db, request, project=project, session=session, assets=assets, todo=todo)
-    initial_plan = lats_plan(request)
-    yield {"type": "plan", "plan": initial_plan.model_dump(mode="json")}
-    trace_events: list[PlanExecutionStep] = []
-    plan, retrieval, answer = execute_lats_agent_plan(
-        db,
-        request,
-        context,
-        on_step=trace_events.append,
-    )
-    for step in trace_events:
-        yield {"type": "trace", "step": step.model_dump(mode="json")}
-    if plan.trace_tree:
-        yield {"type": "trace_tree", "trace_tree": plan.trace_tree}
-    yield {
-        "type": "solver_summary",
-        "solver_summary": plan.solver_summary,
-        "replan_count": plan.replan_count,
-        "replan_reason": plan.replan_reason,
-    }
-    yield {"type": "answer_delta", "delta": answer.answer, "answer": answer.answer}
-    memory = consolidate_memory(
-        db,
-        ConsolidateMemoryRequest(
-            project_id=request.project_id,
-            session_id=request.session_id,
-            sequence_id=request.sequence_id,
-            user_query=request.user_query,
-            asset_ids=request.asset_ids,
-            todo_id=request.todo_id,
-            answer=answer.answer,
-            citations=answer.citations,
-        ),
-        todo=todo,
-    )
-    answer = attach_answer_quality(plan, retrieval, answer, memory)
-    yield {"type": "answer_quality", "quality": answer.quality.model_dump(mode="json")}
-    trace_id = f"trace-{uuid.uuid4().hex[:12]}"
-    run = persist_research_run(
-        db,
-        project=project,
-        session=session,
-        request=request,
-        context=context,
-        plan=plan,
-        retrieval=retrieval,
-        answer=answer,
-        memory=memory,
-        todo=todo,
-        trace_id=trace_id,
-    )
-    yield {"type": "complete", "run": run_to_detail(run).model_dump(mode="json")}
+    start_long_term_memory_maintenance(project.id, session.id, request.sequence_id)
 
 
 def create_and_run(
@@ -5050,27 +4814,6 @@ def create_agent_and_run(
     payload: ResearchTurnRequest,
 ) -> ResearchRunDetailResponse:
     result = run_agent_research(
-        db,
-        TurnScopedRequest(
-            project_id=project_id,
-            session_id=session_id,
-            sequence_id=payload.sequence_id,
-            user_query=payload.user_query,
-            asset_ids=payload.asset_ids,
-            todo_id=payload.todo_id,
-        ),
-    )
-    run = db.scalar(select(ResearchRun).where(ResearchRun.trace_id == result.trace_id))
-    return get_run(db, run.id)
-
-
-def create_lats_and_run(
-    db: Session,
-    project_id: str,
-    session_id: str,
-    payload: ResearchTurnRequest,
-) -> ResearchRunDetailResponse:
-    result = run_lats_research(
         db,
         TurnScopedRequest(
             project_id=project_id,

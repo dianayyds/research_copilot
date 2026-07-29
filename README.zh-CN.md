@@ -6,13 +6,14 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 
 ## 项目概览
 
-当前 MVP 围绕固定的 `plan-and-solve` 流程展开：
+当前 MVP 默认围绕 `plan_react_mcp` 流程展开：
 
 1. 构建项目上下文
-2. 规划研究任务
-3. 从项目资产中检索证据
-4. 生成带引用的回答
-5. 持久化分层记忆，供后续追问复用
+2. 由 DeepSeek 输出结构化 plan
+3. 对每个 plan 节点独立执行 ReAct 循环
+4. 通过手写 JSON-RPC MCP client 调用 GitHub MCP tools/resources/prompts
+5. 基于 MCP observation 生成带引用的回答
+6. 持久化分层记忆，供后续追问复用
 
 后端同时提供 API 和前端工作区，因此本地部署比较直接。
 
@@ -25,11 +26,7 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 - 实现基于 Qdrant + BGE-M3 + BM25/jieba + BGE Reranker 的 Hybrid RAG 检索链路，融合语义检索、关键词检索、RRF 排序和 rerank 精排，为回答生成提供可追溯 citation 证据。
 - 引入 Query Rewrite 检索增强层，支持 standalone query、Step-back 抽象查询、HyDE 假设性文档和领域词扩展；在语义通信 benchmark 中将 hit@1 从 0.80 提升至 0.93，MRR@5 从 0.869 提升至 0.967。
 - 设计 working / episodic / semantic 三层记忆体系：working 保存会话内近期问答，episodic 记录项目级研究事件，semantic 抽取事实、决策、开放问题和偏好，并结合向量检索支持长期语义召回。
-- 实现 Plan-and-Solve 主控的 Agent 执行链路，在规划阶段拆解研究目标，在执行阶段引入 ReAct 式工具调用完成检索、观察、校验和答案综合，实现复杂研究问答过程可追踪、结果可复盘。
-
-实验扩展：
-
-- 基于 Qwen3-0.6B + LoRA + TRL 完成 SFT + DPO 后训练实验，用于 Agent 工具调用决策对齐；在分层 held-out eval 上将 JSON 有效率 46.7% 提升至 100%，action accuracy 26.7% 提升至 86.7%，tool-needed F1 47.1% 提升至 100%。详见 [SFT + DPO Tool-Use Alignment Report](docs/sft-dpo-tool-use-report.md)。
+- 将默认执行链路重构为 Plan -> per-node ReAct -> MCP：DeepSeek 先输出结构化计划，每个计划节点独立执行 thought/action/observation 循环，并通过手写 JSON-RPC 2.0 client 调用 GitHub MCP 能力，同时用只读识别和副作用 allowlist 控制工具风险。
 
 扩展规划：
 
@@ -39,11 +36,11 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 
 ![Research Copilot 主页面与 Agent 执行轨迹](docs/images/main-page-agent-trace.png)
 
-主页面把对话、项目资产和运行历史放在同一个工作区里。左侧栏用于新建对话、查看资产和切换最近会话，中间区域展示当前问答。当勾选 Agent 模式时，回答区域会显示逐步执行轨迹，方便查看系统如何选择本地 RAG、公开搜索、记忆、TODO、资产列表或计算器等工具，并最终生成回答。
+主页面把对话、项目资产和运行历史放在同一个工作区里。左侧栏用于新建对话、查看资产和切换最近会话，中间区域展示当前问答。回答区域会显示逐步执行轨迹，方便查看系统如何检索证据、调用工具、整理观察结果并最终生成回答。
 
 ## 当前能力
 
-- 项目 CRUD 和仪表盘概览
+- 项目 CRUD 和汇总计数
 - 文本、Markdown 和 PDF 资产的创建、编辑与上传
 - 支持浏览器 MD5、Redis bitmap 进度和 MinIO 分片合并的断点续传上传
 - TODO 的创建、编辑、删除和直接执行
@@ -51,22 +48,25 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 - 本地 reranker 对证据做最终排序
 - 带引用回答生成
 - 实时/公开信息工具路由，天气类问题优先调用外部天气工具
-- 可选 LATS Agent/MCTS 模式，用于在 RAG、联网、天气、记忆、资产、TODO、计算器和最终回答之间搜索工具决策路径
+- 默认 Plan-ReAct MCP 模式，支持面向 GitHub 信息的研究问答
+- 手写 MCP client，支持 stdio 主路径和 Streamable HTTP transport 骨架
+- Plan-Act-Observe Agent 模式，可在 RAG、联网、天气、记忆、资产、TODO 和计算器之间进行结构化工具调用
 - 面向研究场景的 skill/tool registry，包含只读/副作用风险元数据
-- Agent/LATS 搜索树可视化，用于回放决策过程和检查最佳路径
+- Agent 执行轨迹可视化，用于回放工具选择、观察结果和答案综合过程
 - working、episodic、semantic 三层记忆
 - 运行历史和详细执行结果查看
 - 由同一个 FastAPI 服务直接提供浏览器工作区
 
 ## 运行行为
 
-- 默认执行模式：`plan_and_solve`
+- 默认执行模式：`plan_react_mcp`
 - 默认 LLM 目标：`deepseek/deepseek-chat`
 - 默认向量库：`qdrant`
 - 默认向量模型：`BAAI/bge-m3`
 - 默认重排模型：`BAAI/bge-reranker-base`
-- 如果设置了 `LLM_API_KEY`，运行时会调用 DeepSeek Chat API 生成答案。
-- 如果 `LLM_API_KEY` 为空，系统会退回到确定性的带引用摘要，保证整条流程仍可执行。
+- 默认 Plan-ReAct MCP 路径要求 `LLM_PROVIDER=deepseek` 且 `LLM_API_KEY` 非空。
+- 默认 GitHub MCP 路径要求配置 `GITHUB_PERSONAL_ACCESS_TOKEN`。
+- 旧的确定性/本地 RAG 流程仍可通过切换 `EXECUTION_MODE` 作为内部兼容路径使用，但不再是前端默认入口。
 
 ## 架构组成
 
@@ -78,6 +78,8 @@ Research Copilot 是一个面向项目范围知识工作的本地优先研究工
 - `BGE-M3`：本地 dense embedding
 - `BM25 + jieba`：词法检索和中文分词
 - `BGE reranker`：本地证据重排
+- `MCP client`：手写 JSON-RPC 2.0 lifecycle、tools、resources、prompts 调用层
+- `GitHub MCP server`：默认外部 MCP 能力提供方，通过 Docker 启动
 - `Redis`、`MinIO`、可选 `Ollama`：用于断点续传进度、对象分片和后续工作流扩展
 
 ## 仓库结构
@@ -108,7 +110,8 @@ research_copilot/
 
 - Docker 和 Docker Compose
 - 至少数 GB 的可用磁盘空间，用于本地 embedding 和 reranker 模型
-- 如果你希望使用真实 LLM 生成而不是 fallback 摘要，需要准备 DeepSeek API Key
+- 默认 Plan-ReAct MCP 运行时需要 DeepSeek API Key
+- 默认 GitHub MCP server 需要 GitHub personal access token
 
 ### 启动完整本地栈
 
@@ -117,6 +120,23 @@ cd /home/wsl/code/research_copilot
 cp .env.example .env
 docker compose up -d --build
 ```
+
+### 在全新 Ubuntu 服务器部署
+
+仓库包含 Ubuntu Docker 环境安装脚本和一键部署脚本：
+
+```bash
+git clone https://github.com/dianayyds/research_copilot.git
+cd research_copilot
+bash scripts/install_server_environment.sh
+# 重新登录服务器，使 docker 用户组生效
+cp .env.example .env
+# 编辑 .env，填写 LLM_API_KEY 和 GITHUB_PERSONAL_ACCESS_TOKEN
+bash scripts/deploy_server.sh
+```
+
+完整的服务器部署、密钥和数据持久化说明见
+[服务器部署指南](docs/server-deployment.md)。
 
 启动后可访问：
 
@@ -133,9 +153,11 @@ docker compose --profile llm up -d
 ## 首次运行说明
 
 - `docker-compose.yml` 会把本地 `./models` 挂载到容器内的 `/models`。
+- `docker-compose.yml` 也会把 `/var/run/docker.sock` 挂载到 runtime 容器内，使后端可以通过 `docker run` 启动 `ghcr.io/github/github-mcp-server`。
 - 如果 `./models` 下还没有所需的 BAAI 模型快照，运行时会在首次使用时从 Hugging Face 自动下载。
 - 这些模型文件体积较大，且已经被排除在 Git 之外。
 - 当前默认单个文件上传大小限制是 `100 MB`。
+- Docker socket 挂载属于高权限本地开发配置，不应直接视为生产环境安全部署方案。
 
 ## 配置说明
 
@@ -149,17 +171,19 @@ docker compose --profile llm up -d
 | `LLM_PROVIDER` | `deepseek` | LLM 提供方目标 |
 | `LLM_MODEL` | `deepseek-chat` | 聊天模型名 |
 | `LLM_API_BASE` | `https://api.deepseek.com` | DeepSeek API 地址 |
-| `LLM_API_KEY` | 空 | 设置后启用真实 LLM 回答生成 |
+| `LLM_API_KEY` | 空 | 默认 Plan-ReAct MCP 流程必需 |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | 本地向量模型 |
 | `RERANKER_MODEL` | `BAAI/bge-reranker-base` | 本地重排模型 |
 | `VECTOR_STORE_PROVIDER` | `qdrant` | 向量存储后端 |
 | `QDRANT_COLLECTION` | `knowledge_chunks` | 知识分块集合名 |
 | `SEMANTIC_MEMORY_COLLECTION` | `semantic_memory_facts` | 语义记忆集合名 |
-| `EXECUTION_MODE` | `plan_and_solve` | 执行模式 |
+| `EXECUTION_MODE` | `plan_react_mcp` | 执行模式 |
 | `QUERY_REWRITE_ENABLED` | `true` | 是否启用混合 Query Rewrite 检索扩展 |
 | `QUERY_REWRITE_HYDE_ENABLED` | `true` | 是否生成 HyDE 假想答案文档查询 |
 | `QUERY_REWRITE_STEP_BACK_ENABLED` | `true` | 是否生成 Step-back 抽象查询 |
 | `QUERY_REWRITE_MAX_QUERIES` | `10` | 单轮本地 RAG 最多使用的重写/扩展查询数 |
+| `WORKING_MEMORY_TOKEN_THRESHOLD` | `1200` | working memory 触发压缩前的 token 预算 |
+| `WORKING_MEMORY_COMPACTION_RATIO` | `0.75` | 溢出时送入 LLM 记忆整理器的最旧 working memory token 占比 |
 | `UPLOAD_MAX_BYTES` | `104857600` | 文件上传大小上限，单位字节 |
 | `RESUMABLE_UPLOAD_MAX_BYTES` | `1073741824` | 断点续传上传大小上限，单位字节 |
 | `RESUMABLE_UPLOAD_CHUNK_SIZE` | `8388608` | 前端分片上传默认分片大小 |
@@ -169,11 +193,20 @@ docker compose --profile llm up -d
 | `LLM_TOOL_PLANNER_ENABLED` | `true` | 是否让 LLM 先决定实时工具，再回退规则 |
 | `LLM_TOOL_PLANNER_TIMEOUT_SECONDS` | `20.0` | 单次 LLM 工具规划调用超时时间 |
 | `AGENT_MAX_STEPS` | `5` | `/agent/run` 的 Plan-Act-Observe 最大步数 |
-| `LATS_BRANCHING_FACTOR` | `4` | LATS 每个节点最多展开的候选 Agent 动作数 |
-| `LATS_MAX_DEPTH` | `2` | LATS Agent 决策树最大深度 |
-| `LATS_ITERATIONS` | `6` | `/lats/run` 的 MCTS 迭代预算 |
 | `PUBLIC_WEB_SEARCH_ENABLED` | `true` | 是否允许显式联网/搜索类问题调用公开搜索工具 |
 | `LIVE_TOOL_TIMEOUT_SECONDS` | `8.0` | 单次外部工具调用超时时间 |
+| `PLAN_REACT_MAX_TASKS` | `6` | 单次 Plan-ReAct MCP 运行最多计划节点数 |
+| `PLAN_REACT_DEFAULT_NODE_ITERATIONS` | `4` | 每个计划节点默认 ReAct 循环上限 |
+| `PLAN_REACT_LLM_TIMEOUT_SECONDS` | `60.0` | planner、ReAct decision 和最终综合 LLM 调用超时时间 |
+| `MCP_ENABLED` | `true` | 是否启用 MCP 执行 |
+| `MCP_GITHUB_ENABLED` | `true` | 是否注册 GitHub MCP server |
+| `MCP_GITHUB_TRANSPORT` | `stdio` | GitHub MCP transport，当前默认走 `stdio` |
+| `MCP_GITHUB_COMMAND` | `docker run --rm -i -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server` | stdio 启动命令 |
+| `MCP_GITHUB_ALLOWED_SIDE_EFFECT_TOOLS` | 空 | 允许自动执行的非只读 GitHub MCP tool allowlist，逗号分隔 |
+| `MCP_PROTOCOL_VERSION` | `2025-06-18` | initialize 时发送的 MCP 协议版本 |
+| `MCP_REQUEST_TIMEOUT_SECONDS` | `30.0` | 单次 MCP 请求超时时间 |
+| `MCP_INITIALIZE_TIMEOUT_SECONDS` | `20.0` | MCP 初始化握手超时时间 |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | 空 | 默认 GitHub MCP server 必需 |
 | `DATABASE_URL` | 空 | 可选，用于覆盖默认 MySQL 连接串 |
 
 ## API 概览
@@ -187,27 +220,32 @@ Swagger UI 地址是 `/docs`。
 | 接口 | 方法 | 作用 |
 | --- | --- | --- |
 | `/healthz` | `GET` | 服务状态和依赖概览 |
-| `/api/v1/config/providers` | `GET` | 当前 provider 配置 |
-| `/api/v1/dashboard` | `GET` | 项目和运行仪表盘 |
 | `/api/v1/projects` | `GET`, `POST` | 查询或创建项目 |
 | `/api/v1/projects/{project_id}` | `GET`, `PATCH`, `DELETE` | 管理单个项目 |
-| `/api/v1/projects/{project_id}/assets` | `GET`, `POST` | 查询或创建项目资产 |
+| `/api/v1/projects/{project_id}/sessions` | `GET`, `POST` | 查询或创建项目会话 |
+| `/api/v1/sessions/{session_id}` | `PATCH` | 更新单个会话的标题、摘要或状态 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}` | `DELETE` | 删除单个项目会话 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/run` | `POST` | 执行一次研究任务 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/run/stream` | `POST` | 以 NDJSON 事件流执行研究任务 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/agent/run` | `POST` | 执行一次 Plan-Act-Observe Agent 任务 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/agent/run/stream` | `POST` | 以 NDJSON 事件流执行 Agent 任务 |
+| `/api/v1/projects/{project_id}/sessions/{session_id}/runs` | `GET` | 查看会话运行历史 |
+| `/api/v1/runs/{run_id}` | `GET` | 查看单次已保存运行的完整 trace payload |
+| `/api/v1/assets` | `GET`, `POST` | 查询或创建全局资产 |
 | `/api/v1/assets/upload-file` | `POST` | 旧版单请求上传 `.txt`、`.md`、`.markdown`、`.pdf` |
 | `/api/v1/assets/uploads/init` | `POST` | 按 MD5 创建或恢复分片上传 |
+| `/api/v1/assets/uploads/{upload_id}/status` | `GET` | 查看已上传和缺失的分片序号 |
 | `/api/v1/assets/uploads/{upload_id}/chunks` | `POST` | 上传单个分片，并写入 Redis bitmap |
 | `/api/v1/assets/uploads/{upload_id}/complete` | `POST` | 合并 MinIO 分片、解析文件并创建资产 |
 | `/api/v1/assets/{asset_id}` | `PATCH`, `DELETE` | 更新或删除单个资产 |
 | `/api/v1/projects/{project_id}/todos` | `GET`, `POST` | 查询或创建 TODO |
 | `/api/v1/todos/{todo_id}` | `PATCH`, `DELETE` | 更新或删除单个 TODO |
-| `/api/v1/projects/{project_id}/run` | `POST` | 执行一次研究任务 |
-| `/api/v1/projects/{project_id}/runs` | `GET` | 查看运行历史 |
 | `/api/v1/projects/{project_id}/memory` | `GET` | 查看分层记忆记录 |
-| `/api/v1/runtime/research/run` | `POST` | 直接调用运行时管线 |
 
 ### 示例：上传文本资产
 
 ```bash
-curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-text \
+curl -X POST http://127.0.0.1:8001/api/v1/assets/upload-file \
   -F "asset_type=note" \
   -F "title=system-notes.txt" \
   -F "file=@./system-notes.txt"
@@ -216,10 +254,11 @@ curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/assets/upload-te
 ### 示例：执行研究任务
 
 ```bash
-curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/run \
+curl -X POST http://127.0.0.1:8001/api/v1/projects/<project_id>/sessions/<session_id>/run \
   -H "Content-Type: application/json" \
   -d '{
     "user_query": "请总结论文与代码仓之间的关系",
+    "sequence_id": 1,
     "asset_ids": []
   }'
 ```
@@ -258,10 +297,8 @@ curl http://127.0.0.1:8001/healthz
 
 - [系统架构](docs/architecture.md)
 - [用户手册](docs/user-manual.md)
-- [技术亮点](docs/technical-highlights.md)
-- [MVP 路线图](docs/mvp-roadmap.md)
-- [源码映射](docs/source-mapping.md)
-- [SFT + DPO 工具调用对齐实验](docs/sft-dpo-tool-use-report.md)
+- [服务器部署](docs/server-deployment.md)
+- [项目技术速查](docs/project-technical-reference.md)
 - [工作流契约](specs/workflows/research-copilot.yaml)
 
 ## License

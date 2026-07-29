@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Research Copilot</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260428-agent-modes" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260428-agent" />
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -54,12 +54,8 @@
               <div class="composer-left">
                 <div class="composer-hint" id="sequence-hint">下一轮 #1</div>
                 <label class="agent-toggle">
-                  <input id="plan-solve-mode-toggle" type="radio" name="agent-mode" value="plan_and_solve" checked />
-                  <span>Plan-and-Solve Agent</span>
-                </label>
-                <label class="agent-toggle">
-                  <input id="lats-mode-toggle" type="radio" name="agent-mode" value="lats_agent" />
-                  <span>LATS Agent</span>
+                  <input id="plan-solve-mode-toggle" type="radio" name="agent-mode" value="plan_react_mcp" checked />
+                  <span>Plan-ReAct MCP Agent</span>
                 </label>
               </div>
               <button class="send-button" id="composer-submit" type="submit" aria-label="发送">
@@ -140,6 +136,6 @@
       </aside>
     </div>
 
-    <script src="/static/app.js?v=20260428-agent-modes"></script>
+    <script src="/static/app.js?v=20260428-agent"></script>
   </body>
 </html>

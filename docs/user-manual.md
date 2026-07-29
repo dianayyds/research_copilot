@@ -10,6 +10,16 @@ docker compose up -d --build
 
 Open `http://127.0.0.1:8001/`.
 
+For a fresh Ubuntu server, install Docker and deploy the complete stack with:
+
+```bash
+bash scripts/install_server_environment.sh
+bash scripts/deploy_server.sh
+```
+
+See [Server Deployment](server-deployment.md) for secret configuration,
+persistent volumes, and update instructions.
+
 ## 2. Create a Project
 
 Use the left sidebar form to create a project. A project is the top-level
@@ -44,13 +54,16 @@ You have two execution paths:
 1. Click `执行` on a TODO
 2. Enter a custom question in the `执行面板`
 
-The system will run:
+By default, the system runs the Plan-ReAct MCP path:
 
 - context packing
-- task planning
-- local hybrid retrieval
-- answer synthesis
+- structured planning
+- per-node ReAct actions through configured MCP capabilities
+- cited answer synthesis from observations
 - memory consolidation
+
+Local hybrid retrieval remains available in the legacy RAG path and through
+agent tools that search uploaded assets.
 
 ## 6. Review Results
 

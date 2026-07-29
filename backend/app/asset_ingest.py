@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 import re
+
+from app.document_processing import pdf_document
 
 
 SUPPORTED_UPLOAD_EXTENSIONS = {".txt", ".md", ".markdown", ".pdf"}
@@ -83,36 +84,6 @@ def text_document(text: str, *, title: str, filename: str) -> str:
     if not body:
         raise ValueError("Text file is empty")
     return collapse_blank_lines(f"# {title}\n\n来源文件：{filename}\n\n{body}")
-
-
-def normalize_pdf_text(text: str) -> str:
-    lines = [line.strip() for line in normalize_newlines(text).splitlines()]
-    paragraphs: list[str] = []
-    current: list[str] = []
-    for line in lines:
-        if not line:
-            if current:
-                paragraphs.append(" ".join(current))
-                current = []
-            continue
-        current.append(re.sub(r"\s+", " ", line))
-    if current:
-        paragraphs.append(" ".join(current))
-    return "\n\n".join(paragraphs).strip()
-
-
-def pdf_document(raw: bytes, *, title: str, filename: str) -> str:
-    from pypdf import PdfReader
-
-    reader = PdfReader(BytesIO(raw))
-    pages: list[str] = []
-    for index, page in enumerate(reader.pages, start=1):
-        extracted = normalize_pdf_text(page.extract_text() or "")
-        if extracted:
-            pages.append(f"## 第{index}页\n\n{extracted}")
-    if not pages:
-        raise ValueError("PDF 中没有可提取的文本")
-    return collapse_blank_lines(f"# {title}\n\n来源文件：{filename}\n\n" + "\n\n".join(pages))
 
 
 def parse_uploaded_asset(

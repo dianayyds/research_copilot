@@ -7,18 +7,23 @@ import os
 
 import httpx
 import pytest
+from fastapi import BackgroundTasks
 
 os.environ["DATABASE_URL"] = "sqlite:////tmp/research_copilot_test.db"
 os.environ["VECTOR_STORE_PROVIDER"] = "stub"
 os.environ["EMBEDDING_PROVIDER"] = "stub"
 os.environ["LLM_PROVIDER"] = "stub"
 os.environ["LLM_API_KEY"] = ""
+os.environ["EXECUTION_MODE"] = "legacy_plan_and_solve"
 
 from app.db import Base, engine  # noqa: E402
+from app.config import settings  # noqa: E402
+import app.main as main_module  # noqa: E402
+import app.memory_manager as memory_manager  # noqa: E402
 from app.live_tools import LiveToolEvidence, LiveToolResult, LiveToolRoute  # noqa: E402
 from app.memory_manager import MemoryContextBundle  # noqa: E402
 from app.main import app  # noqa: E402
-from app.services import AgentDecision, focused_memory_observation_text  # noqa: E402
+from app.services import AgentDecision, chunk_payloads, focused_memory_observation_text  # noqa: E402
 from app.semantic_store import get_semantic_memory_store, reset_semantic_memory_store  # noqa: E402
 from app.vector_store import get_vector_store, reset_vector_store  # noqa: E402
 
@@ -32,6 +37,7 @@ def anyio_backend() -> str:
 
 
 def reset_db() -> None:
+    settings.execution_mode = "legacy_plan_and_solve"
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     reset_vector_store()
@@ -54,6 +60,36 @@ async def create_session(client: httpx.AsyncClient, project_id: str, title: str 
 def make_client() -> httpx.AsyncClient:
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
+
+
+def enable_fake_memory_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memory_manager, "llm_memory_available", lambda: True)
+    monkeypatch.setattr(
+        memory_manager,
+        "llm_summarize_working_memories",
+        lambda *args, **kwargs: {
+            "episodic_memories": [
+                {
+                    "event_type": "working_memory_summary",
+                    "summary": "项目记忆整理：用户要求沉淀三层记忆和项目进展。",
+                    "details": {"topic": "memory"},
+                    "importance": 0.8,
+                }
+            ],
+            "semantic_memories": [
+                {
+                    "fact_type": "fact",
+                    "memory_key": "project_layered_memory",
+                    "statement": "项目采用 working、episodic、semantic 三层记忆。",
+                    "subject": "project",
+                    "predicate": "uses",
+                    "object": "layered memory",
+                    "importance": 0.82,
+                    "metadata": {"topic": "memory"},
+                }
+            ],
+        },
+    )
 
 
 def make_pdf_bytes(text: str) -> bytes:
@@ -130,8 +166,7 @@ async def test_root_page_serves_workspace() -> None:
     assert "Research Copilot" in response.text
     assert "新对话" in response.text
     assert "资产" in response.text
-    assert "Plan-and-Solve Agent" in response.text
-    assert "LATS Agent" in response.text
+    assert "Plan-ReAct MCP Agent" in response.text
 
 
 async def test_skill_registry_lists_research_skills_and_tools() -> None:
@@ -167,7 +202,7 @@ async def test_memory_read_focuses_on_query_relevant_snippets() -> None:
         ],
         episodic_lines=[
             "- [research_run] 讲解一下语义通信 -> 语义通信关注含义传输和任务效果。",
-            "- [research_run] 介绍 LATS -> LATS 是一种 Agent 搜索框架。",
+            "- [research_run] 介绍 unrelated framework -> 这是一个无关的历史主题。",
         ],
         semantic_lines=[
             "- fact.semantic_comm: 语义通信通过语义编码减少冗余比特。",
@@ -180,7 +215,7 @@ async def test_memory_read_focuses_on_query_relevant_snippets() -> None:
     assert "语义通信" in text
     assert "特朗普" not in text
     assert "万斯" not in text
-    assert "LATS" not in text
+    assert "unrelated framework" not in text
 
 
 async def test_project_session_chat_flow_with_global_assets() -> None:
@@ -259,12 +294,14 @@ async def test_project_session_chat_flow_with_global_assets() -> None:
     assert len(runs.json()) == 2
     assert sessions.json()[0]["last_sequence_id"] == 2
     assert any(item["memory_type"] == "working" for item in memory.json())
-    assert any(item["memory_type"] == "episodic" for item in memory.json())
-    assert any(item["memory_type"].startswith("semantic.") for item in memory.json())
+    assert not any(item["memory_type"] == "episodic" for item in memory.json())
+    assert not any(item["memory_type"].startswith("semantic.") for item in memory.json())
 
 
-async def test_second_session_sees_project_long_term_memory_but_not_working_memory() -> None:
+async def test_second_session_sees_compacted_project_long_term_memory_but_not_working_memory(monkeypatch) -> None:
     reset_db()
+    monkeypatch.setattr(settings, "working_memory_token_threshold", 1)
+    enable_fake_memory_llm(monkeypatch)
     async with app.router.lifespan_context(app):
         async with make_client() as client:
             project = await create_project(client, "Memory Project")
@@ -398,8 +435,10 @@ async def test_global_assets_are_visible_across_projects_but_memory_isolated() -
     assert "alpha topic" not in payload["context"]["episodic_memory_context"].lower()
 
 
-async def test_delete_project_clears_project_data_but_keeps_global_assets() -> None:
+async def test_delete_project_clears_project_data_but_keeps_global_assets(monkeypatch) -> None:
     reset_db()
+    monkeypatch.setattr(settings, "working_memory_token_threshold", 1)
+    enable_fake_memory_llm(monkeypatch)
     async with app.router.lifespan_context(app):
         async with make_client() as client:
             project = await create_project(client, "Cleanup")
@@ -481,8 +520,53 @@ async def test_pdf_file_upload_extracts_page_text() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["asset_type"] == "pdf"
-    assert "第1页" in payload["content"]
+    assert "## 第1页" not in payload["content"]
+    assert "<!-- page:1 -->" in payload["content"]
     assert "Plan Solve PDF" in payload["content"]
+
+
+async def test_asset_retrieval_reranks_child_and_expands_parent_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_db()
+    monkeypatch.setattr(settings, "asset_parent_chunk_tokens", 180)
+    monkeypatch.setattr(settings, "asset_child_chunk_tokens", 32)
+    monkeypatch.setattr(settings, "asset_child_chunk_overlap_tokens", 0)
+    monkeypatch.setattr(settings, "asset_context_snippet_chars", 900)
+    content = (
+        "# Parent Child Paper\n\n"
+        "## Method\n\n"
+        "Parent context anchor describes the experiment assumptions before the matching sentence. "
+        "Additional bridge material explains system setup, dataset preparation, channel state tracking, "
+        "and evaluation details that should stay with nearby evidence. "
+        "CSI alignment uses pilot features for robust channel tracking under fast fading. "
+        "Follow-up context explains why the result matters for semantic communication reliability."
+    )
+    async with app.router.lifespan_context(app):
+        async with make_client() as client:
+            project = await create_project(client, "Parent Context")
+            session = await create_session(client, project["id"])
+            asset_response = await client.post(
+                "/api/v1/assets",
+                json={"title": "Parent Child Paper", "asset_type": "markdown", "content": content},
+            )
+            asset = asset_response.json()
+            run = await client.post(
+                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/run",
+                json={
+                    "user_query": "CSI alignment channel tracking",
+                    "sequence_id": 1,
+                    "asset_ids": [asset["id"]],
+                },
+            )
+            payloads = chunk_payloads([type("AssetLike", (), asset)()], [asset["id"]])
+
+    assert run.status_code == 200
+    store = get_vector_store()
+    assert all(item["chunk_level"] == "child" for item in getattr(store, "chunks").values())
+    evidence = run.json()["retrieval"]["evidence_items"][0]
+    child_payload = next(item for item in payloads if item["chunk_id"] == evidence["chunk_id"])
+    assert evidence["snippet"] != child_payload["content"]
+    assert "Parent context anchor" in evidence["snippet"]
+    assert "parent-context" in evidence["tags"]
 
 
 async def test_resumable_chunk_upload_resumes_and_finalizes_asset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -546,6 +630,15 @@ async def test_resumable_chunk_upload_resumes_and_finalizes_asset(monkeypatch: p
                     "chunk_size": 8,
                 },
             )
+            mismatched_resume = await client.post(
+                "/api/v1/assets/uploads/init",
+                json={
+                    "filename": "different.txt",
+                    "file_size": len(content) + 1,
+                    "file_md5": file_md5,
+                    "chunk_size": 8,
+                },
+            )
 
     assert init.status_code == 200
     assert init.json()["total_chunks"] == 3
@@ -560,6 +653,8 @@ async def test_resumable_chunk_upload_resumes_and_finalizes_asset(monkeypatch: p
     assert "chunked upload note text" in completed_payload["asset"]["content"]
     assert duplicate.json()["finalized"] is True
     assert duplicate.json()["asset"]["id"] == completed_payload["asset"]["id"]
+    assert mismatched_resume.status_code == 400
+    assert "metadata does not match requested file" in mismatched_resume.json()["detail"]
 
 
 async def test_solver_replans_when_initial_evidence_is_weak() -> None:
@@ -1045,6 +1140,38 @@ async def test_agent_loop_uses_local_rag_then_creates_todo(monkeypatch: pytest.M
     assert any(todo["title"] == "梳理 Agent 工具注册表" and todo["priority"] == "high" for todo in todos.json())
 
 
+async def test_sync_agent_endpoint_schedules_long_term_memory_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, int]] = []
+    fake_response = {"id": "run-agent-1"}
+
+    def fake_create_agent_and_run(db, project_id: str, session_id: str, payload):
+        assert db is None
+        assert payload.sequence_id == 7
+        return fake_response
+
+    def fake_run_long_term_memory_maintenance(project_id: str, session_id: str, sequence_id: int) -> None:
+        calls.append((project_id, session_id, sequence_id))
+
+    monkeypatch.setattr(main_module, "create_agent_and_run", fake_create_agent_and_run)
+    monkeypatch.setattr(main_module, "run_long_term_memory_maintenance", fake_run_long_term_memory_maintenance)
+
+    background_tasks = BackgroundTasks()
+    response = await main_module.create_agent_and_run_endpoint(
+        "project-1",
+        "session-1",
+        main_module.ResearchTurnRequest(user_query="agent task", sequence_id=7),
+        background_tasks,
+        db=None,
+    )
+
+    assert response is fake_response
+    assert calls == []
+    await background_tasks()
+    assert calls == [("project-1", "session-1", 7)]
+
+
 async def test_agent_loop_uses_public_web_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_db()
 
@@ -1197,205 +1324,6 @@ async def test_agent_stream_emits_agent_trace_events(monkeypatch: pytest.MonkeyP
     assert "agent_observation" in trace_actions
     assert "agent_final" in trace_actions
     assert events[-1]["run"]["plan"]["planner_mode"] == "agent_loop"
-
-
-async def test_lats_agent_mcts_selects_calculator_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    reset_db()
-    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
-    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
-    monkeypatch.setattr("app.services.settings.lats_iterations", 4)
-    async with app.router.lifespan_context(app):
-        async with make_client() as client:
-            project = await create_project(client, "LATS Project")
-            session = await create_session(client, project["id"])
-            response = await client.post(
-                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run",
-                json={
-                    "user_query": "请计算 12 * (3 + 4)",
-                    "sequence_id": 1,
-                    "asset_ids": [],
-                },
-            )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["plan"]["planner_mode"] == "lats_agent_mcts"
-    assert payload["retrieval"]["retrieval_mode"] == "lats_agent_mcts"
-    assert "84" in payload["answer"]["answer"]
-    tree = payload["plan"]["trace_tree"]
-    assert tree["kind"] == "lats_agent_mcts"
-    assert tree["best_actions"] == ["calculator"]
-    assert tree["root"]["children"]
-    assert any(child["action"] == "calculator" and child["skill"] == "quantitative_check" for child in tree["root"]["children"])
-    actions = [step["action"] for step in payload["plan"]["execution_trace"]]
-    assert "lats_select" in actions
-    assert "lats_expand" in actions
-    assert "lats_action" in actions
-    assert "lats_observation" in actions
-    assert "lats_evaluate" in actions
-    assert "lats_backprop" in actions
-    assert "lats_final" in actions
-    assert any("calculator" in step["summary"] for step in payload["plan"]["execution_trace"])
-
-
-async def test_lats_agent_mcts_recovers_from_failed_public_search(monkeypatch: pytest.MonkeyPatch) -> None:
-    reset_db()
-    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
-    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
-    monkeypatch.setattr("app.services.settings.lats_iterations", 4)
-    monkeypatch.setattr("app.services.settings.public_web_search_enabled", True)
-
-    def fail_public_search(route: LiveToolRoute, query: str) -> LiveToolResult:
-        if route.tool_name == "public_web_search":
-            raise ValueError("public search unavailable")
-        return LiveToolResult(answer="", evidence=[], metadata={})
-
-    monkeypatch.setattr("app.services.execute_live_tool", fail_public_search)
-    async with app.router.lifespan_context(app):
-        async with make_client() as client:
-            project = await create_project(client, "LATS Recovery Project")
-            session = await create_session(client, project["id"])
-            asset = (
-                await client.post(
-                    "/api/v1/assets",
-                    json={
-                        "title": "DeepSeek Function Calling",
-                        "asset_type": "note",
-                        "content": (
-                            "DeepSeek function calling lets a chat model choose structured tools, "
-                            "return JSON arguments, and then answer from the tool observations."
-                        ),
-                    },
-                )
-            ).json()
-            response = await client.post(
-                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run",
-                json={
-                    "user_query": "联网搜索一下 DeepSeek function calling 是什么",
-                    "sequence_id": 1,
-                    "asset_ids": [],
-                },
-            )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["plan"]["planner_mode"] == "lats_agent_mcts"
-    assert payload["retrieval"]["evidence_items"][0]["asset_id"] == asset["id"]
-    assert "function calling" in payload["answer"]["answer"].lower()
-    assert "local_rag_search" in payload["plan"]["trace_tree"]["best_actions"]
-    trace = payload["plan"]["execution_trace"]
-    assert any(step["action"] == "lats_observation" and step["status"] == "failed" for step in trace)
-    assert any(step["action"] == "lats_action" and "local_rag_search" in step["summary"] for step in trace)
-    assert any(step["action"] == "lats_final" for step in trace)
-
-
-async def test_lats_concept_overview_prefers_rag_over_memory_dump(monkeypatch: pytest.MonkeyPatch) -> None:
-    reset_db()
-    monkeypatch.setattr("app.services.settings.llm_provider", "deepseek")
-    monkeypatch.setattr("app.services.settings.llm_api_key", "test-key")
-    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
-    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
-    monkeypatch.setattr("app.services.settings.lats_iterations", 1)
-
-    def fake_llm_lats_candidate_actions(request, context, history, *, limit: int):
-        return [
-            (AgentDecision("记忆里可能有旧回答。", "memory_read", {"query": "语义通信"}), 0.99),
-            (
-                AgentDecision(
-                    "检索项目资料。",
-                    "local_rag_search",
-                    {"query": "语义通信 定义 原理 应用"},
-                ),
-                0.5,
-            ),
-        ][:limit]
-
-    def fake_llm_lats_evaluate_node(request, node):
-        if node.decision and node.decision.action == "memory_read":
-            return 1.0, True, "错误地把记忆当作完整答案。"
-        if node.decision and node.decision.action == "local_rag_search":
-            return 0.72, False, "RAG 证据可用于概念综合。"
-        return 0.2, False, "弱分支。"
-
-    def fake_llm_agent_synthesize_answer(request, *, mode, final_text, history, evidence_items):
-        assert mode == "lats_agent_mcts"
-        assert evidence_items
-        return "语义通信是一种面向含义和任务目标的通信范式，可结合语义编码减少冗余传输。"
-
-    monkeypatch.setattr("app.services.llm_lats_candidate_actions", fake_llm_lats_candidate_actions)
-    monkeypatch.setattr("app.services.llm_lats_evaluate_node", fake_llm_lats_evaluate_node)
-    monkeypatch.setattr("app.services.llm_agent_synthesize_answer", fake_llm_agent_synthesize_answer)
-
-    async with app.router.lifespan_context(app):
-        async with make_client() as client:
-            project = await create_project(client, "LATS Concept Project")
-            session = await create_session(client, project["id"])
-            await client.post(
-                "/api/v1/assets",
-                json={
-                    "title": "语义通信笔记",
-                    "asset_type": "note",
-                    "content": "语义通信关注信息含义、任务目标和语义编码，可减少冗余比特传输。",
-                },
-            )
-            response = await client.post(
-                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run",
-                json={
-                    "user_query": "讲一讲语义通信",
-                    "sequence_id": 1,
-                    "asset_ids": [],
-                },
-            )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["retrieval"]["evidence_items"]
-    assert payload["plan"]["trace_tree"]["best_actions"] == ["local_rag_search"]
-    assert all(child["action"] != "memory_read" for child in payload["plan"]["trace_tree"]["root"]["children"])
-    assert "语义通信" in payload["answer"]["answer"]
-    assert "特朗普" not in payload["answer"]["answer"]
-    assert any(step["title"] == "LATS final synthesis" for step in payload["plan"]["execution_trace"])
-
-
-async def test_lats_stream_emits_mcts_trace_events(monkeypatch: pytest.MonkeyPatch) -> None:
-    reset_db()
-    monkeypatch.setattr("app.services.settings.lats_branching_factor", 3)
-    monkeypatch.setattr("app.services.settings.lats_max_depth", 2)
-    monkeypatch.setattr("app.services.settings.lats_iterations", 3)
-    async with app.router.lifespan_context(app):
-        async with make_client() as client:
-            project = await create_project(client, "LATS Stream Project")
-            session = await create_session(client, project["id"])
-            events: list[dict] = []
-            async with client.stream(
-                "POST",
-                f"/api/v1/projects/{project['id']}/sessions/{session['id']}/lats/run/stream",
-                json={
-                    "user_query": "请计算 8 * 7",
-                    "sequence_id": 1,
-                    "asset_ids": [],
-                },
-            ) as response:
-                assert response.status_code == 200
-                async for line in response.aiter_lines():
-                    if line.strip():
-                        events.append(json.loads(line))
-
-    event_types = [event["type"] for event in events]
-    assert "plan" in event_types
-    assert "trace" in event_types
-    assert "trace_tree" in event_types
-    assert "answer_delta" in event_types
-    assert event_types[-1] == "complete"
-    trace_actions = [event["step"]["action"] for event in events if event["type"] == "trace"]
-    assert "lats_expand" in trace_actions
-    assert "lats_select" in trace_actions
-    assert "lats_evaluate" in trace_actions
-    assert "lats_backprop" in trace_actions
-    assert events[-1]["run"]["plan"]["planner_mode"] == "lats_agent_mcts"
-    tree_event = next(event for event in events if event["type"] == "trace_tree")
-    assert tree_event["trace_tree"]["best_actions"] == ["calculator"]
-    assert "56" in events[-1]["run"]["answer"]["answer"]
 
 
 async def test_stream_no_evidence_uses_direct_fallback_without_constrained_stream(
